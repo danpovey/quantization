@@ -5,8 +5,14 @@ from torch import nn
 from torch import Tensor
 from typing import Tuple
 
-# i=14900, ref_loss=0.412, reconstruction_loss=0.423, entropy_loss=0.004, frame_entropy=0.303
-# . for codebook_size=4, num_codebooks=16, frame_entropy_cutoff=0.30000001192092896, entropy_scale=0.01
+
+# i=9900, ref_loss=0.424, reconstruction_loss=0.436, entropy_loss=0.004, frame_entropy=0.304
+# ... for codebook_size=4, num_codebooks=16, frame_entropy_cutoff=0.30000001192092896, entropy_scale=0.01
+# i=9900, ref_loss=0.414, reconstruction_loss=0.421, entropy_loss=0.012, frame_entropy=0.457
+# ... for codebook_size=16, num_codebooks=8, frame_entropy_cutoff=0.45000001788139343, entropy_scale=0.01
+# i=9900, ref_loss=0.407, reconstruction_loss=0.413, entropy_loss=0.161, frame_entropy=0.698
+# ... for codebook_size=256, num_codebooks=4, frame_entropy_cutoff=0.675000011920929, entropy_scale=0.01
+
 
 class Quantizer(nn.Module):
     def __init__(self, dim: int,
