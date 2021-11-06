@@ -98,16 +98,56 @@ class Quantizer(nn.Module):
         shape[-1] = -1
         return indices.reshape(*shape)
 
+    def compute_ref_loss(self, x: Tensor) -> Tensor:
+        """
+        Compute the loss function, not for optimization, with deterministic indexes using
+        argmax not sampling.
+
+        Args:
+                x: the Tensor to quantize, of shape (*, dim)
+
+        Returns:   a scalar torch.Tensor containing the relative sum-squared
+                    reconstruction loss.
+                    It is the sum-squared of (x - reconstructed_x) / sum-squared of x, which will
+                    for already-trained models be between 0 and 1, but could be greater than 1
+                    at the start of training.
+        """
+        logits = self._logits(x)
+
+        # reshape logits to (B, self.num_codebooks, self.codebook_size) where B is the
+        # product of all dimensions of x except the last one.
+        logits = logits.reshape(-1, self.num_codebooks, self.codebook_size)
+        B = logits.shape[0]
+
+        # indices: (B, self.num_codebooks)
+        indices = torch.argmax(logits, dim=-1)
+        # indexes_expanded: (num_codebooks, B, dim)
+        indices_expanded = indices.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
+        # to_output_reshaped: (num_codebooks, codebook_size, dim)
+        to_output_reshaped = self._to_output().reshape(self.num_codebooks, self.codebook_size, self.dim)
+        # chosen_codebooks: (num_codebooks, B, dim).
+        chosen_codebooks = torch.gather(to_output_reshaped, dim=1, index=indices_expanded)
+
+        # tot_codebooks: (1, B, dim), this is the sum of the chosen rows of `to_output` corresponding
+        # to the chosen codebook entries, this would correspond to the approximated x.
+        tot_codebooks = chosen_codebooks.sum(dim=0, keepdim=True)
+        # tot_error: (1, B, dim), the error of the approximated vs. real x.
+        tot_error = tot_codebooks - x.reshape(1, B, self.dim)
+        # tot_error_sumsq: scalar, total squared error.  only needed for diagnostics.
+        tot_error_sumsq = (tot_error**2).sum()
+
+        x_tot_sumsq = (x ** 2).sum() + 1.0e-20
+
+        rel_tot_error_sumsq = tot_error_sumsq / x_tot_sumsq
+
+        return rel_tot_error_sumsq
+
     def compute_loss(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute three (potential) parts of the loss function.
 
         Args:
                 x: the Tensor to quantize, of shape (*, dim)
-        as_bytes:  if True, the quantized output will be returned as a byte
-                   array, combining two codes into a single byte if
-                   codebook_size <= 16.
-
         Returns (reconstruction_loss, entropy_loss, frame_entropy), where:
            reconstruction_loss: a scalar torch.Tensor containing the relative sum-squared
                      reconstruction loss, constructed as an expectation over class probs.
@@ -136,20 +176,14 @@ class Quantizer(nn.Module):
         indices = torch.distributions.categorical.Categorical(probs=probs).sample()
         # indices is of shape (B, self.num_codebooks) and contains elements in [0..codebook_size - 1]
 
-        # for diagnostics only..
-        deterministic_indices = torch.argmax(logits, dim=-1)
-
 
         # to_output_reshaped: (num_codebooks, codebook_size, dim)
         to_output_reshaped = self._to_output().reshape(self.num_codebooks, self.codebook_size, self.dim)
         # indexes_expanded: (num_codebooks, B, dim)
         indices_expanded = indices.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
 
-        deterministic_indices_expanded = deterministic_indices.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
         # chosen_codebooks: (num_codebooks, B, dim).
         chosen_codebooks = torch.gather(to_output_reshaped, dim=1, index=indices_expanded)
-
-        chosen_codebooks_deterministic = torch.gather(to_output_reshaped, dim=1, index=indices_expanded)
 
         # tot_codebooks: (1, B, dim), this is the sum of the chosen rows of `to_output` corresponding
         # to the chosen codebook entries, this would correspond to the approximated x.
@@ -227,7 +261,7 @@ def _test_quantization():
 
 
     # Train quantizer.
-    frame_entropy_cutoff = torch.tensor(0.2, device=device)
+    frame_entropy_cutoff = torch.tensor(0.3, device=device)
     entropy_scale = 0.01
 
     for i in range(15000):
@@ -242,7 +276,8 @@ def _test_quantization():
         reconstruction_loss, entropy_loss, frame_entropy = quantizer.compute_loss(x)
 
         if i % 100 == 0:
-            print(f"i={i}, reconstruction_loss={reconstruction_loss.item():.3f}, entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
+            ref_loss = quantizer.compute_ref_loss(x)
+            print(f"i={i}, ref_loss={ref_loss.item():.3f}, reconstruction_loss={reconstruction_loss.item():.3f}, entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
 
 
         if i == 1000:
