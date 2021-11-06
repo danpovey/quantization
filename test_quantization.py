@@ -5,7 +5,7 @@ from torch import nn
 from torch import Tensor
 from typing import Tuple
 
-
+# i=14900, ref_loss=0.426, reconstruction_loss=0.431, entropy_loss=0.020, frame_entropy=0.338
 class Quantizer(nn.Module):
     def __init__(self, dim: int,
                  codebook_size: int,
@@ -246,14 +246,15 @@ def _test_quantization():
     # out of codebook_size, num_codebooks = (4, 16), (16, 8), (256, 4), all of which
     # give 4 bytes per 512-dimensional vector, the best reconstruction loss
     # SET SIZES:
-    codebook_size = 4
-    num_codebooks = 16
-    print(f"codebook_size={codebook_size}, num_codebooks={num_codebooks}")
+    codebook_size = 16
+    num_codebooks = 8
+
     quantizer = Quantizer(dim=dim, codebook_size=codebook_size, num_codebooks=num_codebooks).to(device)
 
     # training quantizer, not model.
     optim = torch.optim.Adam(
-        quantizer.parameters(), lr=0.005, betas=(0.9, 0.98), eps=1e-9,
+        quantizer.parameters(), lr=0.005, betas=(0.9, 0.98), eps=1e-9, weight_decay=0.00001
+
     )
 
     # We'll choose in the loop how often to step the scheduler.
@@ -263,6 +264,8 @@ def _test_quantization():
     # Train quantizer.
     frame_entropy_cutoff = torch.tensor(0.3, device=device)
     entropy_scale = 0.01
+
+    print(f"codebook_size={codebook_size}, num_codebooks={num_codebooks}")
 
     for i in range(15000):
         B = 600
