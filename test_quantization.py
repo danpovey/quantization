@@ -43,8 +43,39 @@ class Quantizer(nn.Module):
         # self.mask has shape: [ codebook_size * num_codebooks, dim ]
         self.register_buffer('mask', torch.tensor(mask, dtype=torch.bool))
         self.apply_mask = True
-        print("mask = ", self.mask)
+        #print("mask = ", self.mask)
         #self._reset_parameters()
+
+
+    def get_product_quantizer(self) -> 'Quantizer':
+        """
+        Returns a Quantizer object with codebook_size = self.codebook_size**2 and
+           num_codebooks = self.num_codebooks//2, initialized so that each codebook
+           in the result is formed from pairs of codebooks in this object.
+        """
+        new_codebook_size = self.codebook_size ** 2
+        new_num_codebooks = self.num_codebooks // 2
+
+        ans = Quantizer(self.dim,
+                        new_codebook_size,
+                        new_num_codebooks).to(self.to_output.device)
+
+        ans.apply_mask = False
+
+        with torch.no_grad():
+            for c_out in range(new_num_codebooks):
+                c_in1 = 2 * c_out
+                c_in2 = 2 * c_out + 1
+                for k_in1 in range(self.codebook_size):
+                    row_in1 = self.codebook_size * c_in1 + k_in1
+                    for k_in2 in range(self.codebook_size):
+                        row_in2 = self.codebook_size * c_in2 + k_in2
+                        k_out = k_in1 * self.codebook_size + k_in2
+                        row_out = new_codebook_size * c_out + k_out
+                        ans.to_logits.weight[row_out,:] = self.to_logits.weight[row_in1] + self.to_logits.weight[row_in2]
+                        ans.to_logits.bias[row_out] = self.to_logits.bias[row_in1] + self.to_logits.bias[row_in2]
+                        ans.to_output[row_out,:] = self.to_output[row_in1] + self.to_output[row_in2]
+        return ans
 
     def _reset_parameters(self):
         with torch.no_grad():
@@ -233,6 +264,7 @@ class Quantizer(nn.Module):
 
 
 def _test_quantization():
+    torch.manual_seed(1)
     dim = 256
     device = torch.device('cuda')
     model = nn.Sequential(
@@ -253,59 +285,65 @@ def _test_quantization():
 
     quantizer = Quantizer(dim=dim, codebook_size=codebook_size, num_codebooks=num_codebooks).to(device)
 
-    # training quantizer, not model.
-    optim = torch.optim.Adam(
-        quantizer.parameters(), lr=0.005, betas=(0.9, 0.98), eps=1e-9, weight_decay=0.00001
-
-    )
-
-    # We'll choose in the loop how often to step the scheduler.
-    scheduler = torch.optim.lr_scheduler.StepLR(optim, step_size=2500, gamma=0.5)
-
 
     # Train quantizer.
     frame_entropy_cutoff = torch.tensor(0.3, device=device)
     entropy_scale = 0.01
 
+    quantizer.apply_mask = False
 
-    for i in range(15000):
-        B = 600
-        x = torch.randn(B, dim, device=device)
-        x = model(x)  + 0.05 * x
-        # x is the thing we're trying to quantize: the nnet gives it a non-trivial distribution, which is supposed to
-        # emulate a typical output of a neural net.  The "+ 0.1 * x" is a kind of residual term which makes sure
-        # the output is not limited to a subspace or anything too-easy like that.
+    lr=0.005
+    num_iters = 3
+    for iter in range(num_iters):
+
+        # training quantizer, not model.
+        optim = torch.optim.Adam(
+            quantizer.parameters(), lr=lr, betas=(0.9, 0.98), eps=1e-9, weight_decay=0.000001
+        )
+
+        # We'll choose in the loop how often to step the scheduler.
+        scheduler = torch.optim.lr_scheduler.StepLR(optim, step_size=2500, gamma=0.5)
+
+        for i in range(10000):
+            B = 600
+            x = torch.randn(B, dim, device=device)
+            x = model(x)  + 0.05 * x
+            # x is the thing we're trying to quantize: the nnet gives it a non-trivial distribution, which is supposed to
+            # emulate a typical output of a neural net.  The "+ 0.1 * x" is a kind of residual term which makes sure
+            # the output is not limited to a subspace or anything too-easy like that.
 
 
-        reconstruction_loss, entropy_loss, frame_entropy = quantizer.compute_loss(x)
+            reconstruction_loss, entropy_loss, frame_entropy = quantizer.compute_loss(x)
 
-        if i % 100 == 0:
-            ref_loss = quantizer.compute_ref_loss(x)
-            print(f"i={i}, ref_loss={ref_loss.item():.3f}, reconstruction_loss={reconstruction_loss.item():.3f}, entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
+            if i % 100 == 0:
+                ref_loss = quantizer.compute_ref_loss(x)
+                print(f"i={i}, ref_loss={ref_loss.item():.3f}, reconstruction_loss={reconstruction_loss.item():.3f}, "
+                      f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
 
 
-        if i == 1000:
-            print("STOPPING MASK")
-            quantizer.apply_mask = False
+            # reconstruction_loss >= 0, equals 0 when reconstruction is exact.
+            tot_loss = reconstruction_loss
 
-        # reconstruction_loss >= 0, equals 0 when reconstruction is exact.
-        tot_loss = reconstruction_loss
-        #if i < 5000:
-        # entropy_loss approaches 0 from above, as the entropy of classes
-        # approaches its maximum possible.  (this relates to diversity of
-        # chosen codebook entries in classes).
-        tot_loss += entropy_loss * entropy_scale
+            # entropy_loss approaches 0 from above, as the entropy of classes
+            # approaches its maximum possible.  (this relates to diversity of
+            # chosen codebook entries in classes).
+            tot_loss += entropy_loss * entropy_scale
 
-        # We want to maximize frame_entropy if it is less than frame_entropy_cutoff.
-        tot_loss -= torch.minimum(frame_entropy_cutoff,
-                                  frame_entropy)
+            # We want to maximize frame_entropy if it is less than frame_entropy_cutoff.
+            tot_loss -= torch.minimum(frame_entropy_cutoff,
+                                      frame_entropy)
 
-        tot_loss.backward()
-        optim.step()
-        optim.zero_grad()
-        scheduler.step()
+            tot_loss.backward()
+            optim.step()
+            optim.zero_grad()
+            scheduler.step()
 
-    print(f"for codebook_size={codebook_size}, num_codebooks={num_codebooks}, frame_entropy_cutoff={frame_entropy_cutoff.item()}, entropy_scale={entropy_scale}")
+        print(f"... for codebook_size={quantizer.codebook_size}, num_codebooks={quantizer.num_codebooks}, frame_entropy_cutoff={frame_entropy_cutoff.item()}, entropy_scale={entropy_scale}")
+
+        if iter + 1 < num_iters:
+            quantizer = quantizer.get_product_quantizer()
+            frame_entropy_cutoff = frame_entropy_cutoff * 1.5
+            lr *= 0.5
 
 if __name__ == "__main__":
     _test_quantization()
