@@ -5,7 +5,9 @@ from torch import nn
 from torch import Tensor
 from typing import Tuple
 
-# i=14900, ref_loss=0.426, reconstruction_loss=0.431, entropy_loss=0.020, frame_entropy=0.338
+# i=14900, ref_loss=0.412, reconstruction_loss=0.423, entropy_loss=0.004, frame_entropy=0.303
+# . for codebook_size=4, num_codebooks=16, frame_entropy_cutoff=0.30000001192092896, entropy_scale=0.01
+
 class Quantizer(nn.Module):
     def __init__(self, dim: int,
                  codebook_size: int,
@@ -246,8 +248,8 @@ def _test_quantization():
     # out of codebook_size, num_codebooks = (4, 16), (16, 8), (256, 4), all of which
     # give 4 bytes per 512-dimensional vector, the best reconstruction loss
     # SET SIZES:
-    codebook_size = 16
-    num_codebooks = 8
+    codebook_size = 4
+    num_codebooks = 16
 
     quantizer = Quantizer(dim=dim, codebook_size=codebook_size, num_codebooks=num_codebooks).to(device)
 
@@ -265,7 +267,6 @@ def _test_quantization():
     frame_entropy_cutoff = torch.tensor(0.3, device=device)
     entropy_scale = 0.01
 
-    print(f"codebook_size={codebook_size}, num_codebooks={num_codebooks}")
 
     for i in range(15000):
         B = 600
@@ -304,8 +305,7 @@ def _test_quantization():
         optim.zero_grad()
         scheduler.step()
 
-
-
+    print(f"for codebook_size={codebook_size}, num_codebooks={num_codebooks}, frame_entropy_cutoff={frame_entropy_cutoff.item()}, entropy_scale={entropy_scale}")
 
 if __name__ == "__main__":
     _test_quantization()
