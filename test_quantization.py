@@ -516,7 +516,9 @@ def _test_quantization():
             optim.zero_grad()
             scheduler.step()
 
-        print(f"... for codebook_size={quantizer.codebook_size}, num_codebooks={quantizer.num_codebooks}, frame_entropy_cutoff={frame_entropy_cutoff.item():.3f}, entropy_scale={entropy_scale}")
+        print(f"... for codebook_size={quantizer.codebook_size}, num_codebooks={quantizer.num_codebooks}, "
+              f"frame_entropy_cutoff={frame_entropy_cutoff.item():.3f}, entropy_scale={entropy_scale}, "
+              f"det_loss_scale={det_loss_scale}")
 
         if iter + 1 < num_iters:
             quantizer = quantizer.get_product_quantizer()
