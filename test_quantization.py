@@ -38,21 +38,6 @@ class Quantizer(nn.Module):
         self.to_output = nn.Parameter(self.to_logits.weight.detach().clone())
 
 
-        mask = []
-        dims_per_codebook = dim // num_codebooks
-        for i in range(codebook_size * num_codebooks):
-            this_mask_row = []
-            for j in range(dim):
-                # append True if j // dims_per_codebook) == i, else False.
-                this_mask_row.append((j // dims_per_codebook) == (i // codebook_size))
-            mask.append(this_mask_row)
-
-        # self.mask has shape: [ codebook_size * num_codebooks, dim ]
-        self.register_buffer('mask', torch.tensor(mask, dtype=torch.bool))
-        self.apply_mask = True
-        #print("mask = ", self.mask)
-        #self._reset_parameters()
-
 
     def get_product_quantizer(self) -> 'Quantizer':
         """
@@ -84,23 +69,8 @@ class Quantizer(nn.Module):
                         ans.to_output[row_out,:] = self.to_output[row_in1] + self.to_output[row_in2]
         return ans
 
-    def _reset_parameters(self):
-        with torch.no_grad():
-            self.to_logits.weight[:] = self.to_logits.weight * self.mask
-            self.to_output[:] = self.to_logits.weight
-
-
     def _logits(self, x: Tensor) -> Tensor:
-        if self.apply_mask:
-            return (self.to_logits.bias + torch.matmul(x, (self.to_logits.weight * self.mask).t())) * self.logits_scale
-        else:
-            return self.to_logits(x) * self.logits_scale
-
-    def _to_output(self) -> Tensor:
-        if self.apply_mask:
-            return self.to_output * self.mask
-        else:
-            return self.to_output
+        return self.to_logits(x) * self.logits_scale
 
 
     def forward(x: Tensor, as_bytes: bool = False) -> Tensor:
@@ -264,7 +234,7 @@ class Quantizer(nn.Module):
         # indexes_expanded: (num_codebooks, B, dim)
         indices_expanded = indices.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
         # to_output_reshaped: (num_codebooks, codebook_size, dim)
-        to_output_reshaped = self._to_output().reshape(self.num_codebooks, self.codebook_size, self.dim)
+        to_output_reshaped = self.to_output.reshape(self.num_codebooks, self.codebook_size, self.dim)
         # chosen_codebooks: (num_codebooks, B, dim).
         chosen_codebooks = torch.gather(to_output_reshaped, dim=1, index=indices_expanded)
 
@@ -316,7 +286,7 @@ class Quantizer(nn.Module):
 
 
         # to_output_reshaped: (num_codebooks, codebook_size, dim)
-        to_output_reshaped = self._to_output().reshape(self.num_codebooks, self.codebook_size, self.dim)
+        to_output_reshaped = self.to_output.reshape(self.num_codebooks, self.codebook_size, self.dim)
         # indexes_expanded: (num_codebooks, B, dim)
         indices_expanded = indices.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
 
@@ -401,8 +371,7 @@ def _test_quantization():
     # Train quantizer.
     frame_entropy_cutoff = torch.tensor(0.3, device=device)
     entropy_scale = 0.02
-
-    quantizer.apply_mask = False
+    ref_loss_scale = 0.9  # should be in [0..1]
 
     lr=0.005
     num_iters = 3
@@ -427,19 +396,23 @@ def _test_quantization():
 
             reconstruction_loss, entropy_loss, frame_entropy = quantizer.compute_loss(x)
 
+            ref_loss = quantizer.compute_ref_loss(x, 1)
+
             if i % 100 == 0:
                 # only do at most 2 iterations of refining clusters if
                 # num_codebooks <= 8, because in this case we use a more exact
                 # algorithm for which we have never seen an improvement after
                 # the 2st iteration of refinement.
-                n = 3 if num_codebooks <= 8 else 4
+                n = 3 if quantizer.num_codebooks <= 8 else 4
                 ref_losses = [ float('%.3f' % quantizer.compute_ref_loss(x, i).item()) for i in range(n) ]
-                print(f"i={i}, ref_loss{0,1,2,3}={ref_losses}, expected_loss={reconstruction_loss.item():.3f}, "
+                print(f"i={i}, ref_loss(0,1,..)={ref_losses}, expected_loss={reconstruction_loss.item():.3f}, "
                       f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
 
 
             # reconstruction_loss >= 0, equals 0 when reconstruction is exact.
-            tot_loss = reconstruction_loss
+            tot_loss = reconstruction_loss * (1 - ref_loss_scale)
+
+            tot_loss += ref_loss * ref_loss_scale
 
             # entropy_loss approaches 0 from above, as the entropy of classes
             # approaches its maximum possible.  (this relates to diversity of
