@@ -34,7 +34,7 @@ class Quantizer(nn.Module):
         # we will sometimes interpret to_output, which is of shape
         # (num_codebooks * codebook_size, dim), as being of shape
         # (num_codebooks, codebook_size, dim); and similarly with self.to_logits
-        self.to_output = nn.Parameter(self.to_logits.weight.detach().clone())
+        self.centers = nn.Parameter(self.to_logits.weight.detach().clone())
 
 
 
@@ -49,7 +49,7 @@ class Quantizer(nn.Module):
 
         ans = Quantizer(self.dim,
                         new_codebook_size,
-                        new_num_codebooks).to(self.to_output.device)
+                        new_num_codebooks).to(self.centers.device)
 
         ans.apply_mask = False
 
@@ -65,7 +65,7 @@ class Quantizer(nn.Module):
                         row_out = new_codebook_size * c_out + k_out
                         ans.to_logits.weight[row_out,:] = self.to_logits.weight[row_in1] + self.to_logits.weight[row_in2]
                         ans.to_logits.bias[row_out] = self.to_logits.bias[row_in1] + self.to_logits.bias[row_in2]
-                        ans.to_output[row_out,:] = self.to_output[row_in1] + self.to_output[row_in2]
+                        ans.to_output[row_out,:] = self.centers[row_in1] + self.centers[row_in2]
         return ans
 
     def _logits(self, x: Tensor) -> Tensor:
@@ -86,8 +86,8 @@ class Quantizer(nn.Module):
                  array, combining as many codes as possible into each bytes
                  codebook_size <= 16.
 
-        Returns:  if as_bytes == False, returns a torch.LongTensor of shape (*, num_codebooks);
-                  if as_bytes == True, returns a Tensor of dtype=torch.uint8, of shape
+        Returns:  if as_bytes == Falsea torch.LongTensor of shape (*, num_codebooks);
+                  if as_bytes == True, a returns a Tensor of dtype=torch.uint8, of shape
                   (*, num_codebooks/n), where n==4 if codebook_size <= 14; or
                      2 if codebook_size <= 16, else 1.
         """
@@ -95,12 +95,14 @@ class Quantizer(nn.Module):
         indexes = self._compute_indexes(x_reshaped, refine_indexes_iters)
 
         if as_bytes:
-            num_codebooks = self.num_codebooks
-            while num_codebooks ** 2 <= 256:
-                indexes = (indexes[:, ::2] * num_codebooks + indexes[:, 1::2])
-                num_codebooks = num_codebooks ** 2
-            assert num_codebooks <= 256
-            indexes = indexes.to(torch.int8)
+            codebook_size = self.codebook_size
+            while codebook_size ** 2 <= 256:
+                indexes = (indexes[:, ::2] + codebook_size * indexes[:, 1::2])
+                codebook_size = codebook_size ** 2
+            assert codebook_size <= 256
+            indexes = indexes.to(torch.uint8)
+
+
         return indexes.reshape(*x.shape[:-1], -1)
 
     def _compute_indexes(self, x: Tensor, refine_indexes_iters: int = 2) -> Tensor:
@@ -211,7 +213,7 @@ class Quantizer(nn.Module):
         # indexes_expanded has shape (B, self.num_codebooks, 1, self.dim)
         indexes_expanded = indexes.unsqueeze(-1).unsqueeze(-1).expand(B, self.num_codebooks, 1, self.dim)
         # all_centers: (1, num_codebooks, codebook_size, dim)
-        all_centers = self.to_output.reshape(1, self.num_codebooks, self.codebook_size, self.dim)
+        all_centers = self.centers.reshape(1, self.num_codebooks, self.codebook_size, self.dim)
         # centers_expanded has shape (B, self.num_codebooks, self.codebook_size, self.dim)
         centers_expanded = all_centers.expand(B, self.num_codebooks, self.codebook_size, self.dim)
 
@@ -282,24 +284,57 @@ class Quantizer(nn.Module):
         assert indexes.ndim == 2
         return indexes
 
+
+    def _maybe_separate_indexes(self, indexes: Tensor) -> Tensor:
+        """
+        This reverses the process done in encode() if as_bytes==True, which combines
+        multiple codebook entries into a single byte if self.codebook_size is small
+        enough.
+            Args:
+                 indexes: an integer tensor of shape (B, n) where n divides
+                       self.num_codebooks
+           Returns: a tensor of the same type as `indexes`, of shape (B,
+                  self.num_codebooks)
+        """
+        B = indexes.shape[0]
+        if indexes.shape[-1] != self.num_codebooks:
+            n = indexes.shape[-1]
+            num_repeats = self.num_codebooks // n
+            assert num_repeats in [2, 4, 8, 16] and self.num_codebooks == n * num_repeats
+            indexes = indexes.unsqueeze(2).expand(B, n, num_repeats)
+            size = self.codebook_size
+            indexes = (indexes // (size ** torch.arange(num_repeats,
+                                                        device=indexes.device))) % size
+            indexes = indexes.reshape(B, self.num_codebooks)
+        assert indexes.shape == (B, self.num_codebooks)
+        return indexes
+
+
+
     def decode(self, indexes: Tensor) -> Tensor:
         """
         Does the (approximate) inverse of _compute_indexes(): constructs from `indexes` the
         corresponding approximated tensor.
         Args:
-             indexes: an integer tensor of shape (*, self.num_codebooks), with entries
-                    in {0..self.num_codebooks-1}.
+             indexes:
+                    May be an integer tensor of shape (*, self.num_codebooks), with entries
+                    in {0..self.num_codebooks-1}
+                    May also contain multiple codebook entries combined into one integer, as
+                    done by encode() with as_bytes==True; in this case the last dim
+                    might be self.num_codebooks/2 or self.num_codebooks/4.
         Returns: a tensor of shape (*, self.dim), consisting of the sum of the specified
                 cluster centers.
         """
         orig_shape = indexes.shape
-        indexes = indexes.reshape(-1, self.num_codebooks)
+        indexes = indexes.reshape(-1, indexes.shape[-1])
+        indexes = self._maybe_separate_indexes(indexes)
+
         assert indexes.ndim == 2
         B = indexes.shape[0]
         # indexes_expanded: (num_codebooks, B, dim)
         indexes_expanded = indexes.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
         # to_output_reshaped: (num_codebooks, codebook_size, dim)
-        to_output_reshaped = self.to_output.reshape(self.num_codebooks, self.codebook_size, self.dim)
+        to_output_reshaped = self.centers.reshape(self.num_codebooks, self.codebook_size, self.dim)
         # chosen_codebooks: (num_codebooks, B, dim).
         chosen_codebooks = torch.gather(to_output_reshaped, dim=1, index=indexes_expanded)
 
@@ -309,10 +344,12 @@ class Quantizer(nn.Module):
         x_approx = chosen_codebooks.sum(dim=0)
         return x_approx.reshape(*orig_shape[:-1], self.dim)
 
+
     def compute_loss_deterministic(self, x: Tensor, refine_indexes_iters: int = 0) -> Tensor:
         """
-        Compute the loss function, not for optimization, with deterministic indexes using
-        argmax not sampling.
+        Compute the loss function with deterministic indexes using argmax not sampling.
+        Like compute_loss(), the result is differentiable w.r.t self.centers but
+        gives no derivative for self.to_logits
 
         Args:
                 x: the Tensor to quantize, of shape (*, dim)
@@ -367,7 +404,7 @@ class Quantizer(nn.Module):
 
 
         # to_output_reshaped: (num_codebooks, codebook_size, dim)
-        to_output_reshaped = self.to_output.reshape(self.num_codebooks, self.codebook_size, self.dim)
+        to_output_reshaped = self.centers.reshape(self.num_codebooks, self.codebook_size, self.dim)
         # indexes_expanded: (num_codebooks, B, dim)
         indexes_expanded = indexes.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
 
@@ -484,6 +521,13 @@ def _test_quantization():
                     det_losses = []
                     for j in range(4):
                         indexes = quantizer.encode(x, j, as_bytes=False)
+                        if random.random()  < 0.1:
+                            # Test the as_bytes option.
+                            indexes2 = quantizer.encode(x, j, as_bytes=True)
+                            assert indexes2.dtype == torch.uint8
+                            indexes_ref = quantizer._maybe_separate_indexes(indexes2)
+                            assert torch.all(indexes_ref == indexes)
+
                         x_err = quantizer.decode(indexes) - x
                         rel_err = (x_err**2).sum() / ((x**2).sum() + 1e-20)
                         rel_err = float('%.3f' % rel_err.item())
