@@ -50,8 +50,6 @@ class MultiKmeansQuantizer(nn.Module):
                                    new_codebook_size,
                                    new_num_codebooks).to(self.centers.device)
 
-        ans.apply_mask = False
-
         with torch.no_grad():
             for c_out in range(new_num_codebooks):
                 c_in1 = 2 * c_out
@@ -61,24 +59,6 @@ class MultiKmeansQuantizer(nn.Module):
                         k_out = k_in1 * self.codebook_size + k_in2
                         ans.centers[c_out,k_out,:] = self.centers[c_in1,k_in1,:] + self.centers[c_in2,k_in2,:]
         return ans
-
-    def _reset_parameters(self):
-        with torch.no_grad():
-            self.to_logits.weight[:] = self.to_logits.weight * self.mask
-            self.to_output[:] = self.to_logits.weight
-
-
-    def _logits(self, x: Tensor) -> Tensor:
-        if self.apply_mask:
-            return (self.to_logits.bias + torch.matmul(x, (self.to_logits.weight * self.mask).t())) * self.logits_scale
-        else:
-            return self.to_logits(x) * self.logits_scale
-
-    def _to_output(self) -> Tensor:
-        if self.apply_mask:
-            return self.to_output * self.mask
-        else:
-            return self.to_output
 
 
     def compute_ref_loss(self, x: Tensor) -> Tensor:
@@ -154,6 +134,7 @@ class MultiKmeansQuantizer(nn.Module):
 
         for i in range(num_iters):
             indexes, entropy_loss, frame_entropy, reconstruction_loss = self.refine_indexes_stochastic(x, indexes)
+
             if False:
                 avg_loss = ((self.decode(indexes) - x) ** 2).sum() / ((x ** 2).sum() + 1e-20)
                 print(f"iter={i}, avg_loss={avg_loss.item():.3f}")
@@ -217,8 +198,7 @@ class MultiKmeansQuantizer(nn.Module):
 
     def refine_indexes(self,
                        x: Tensor,
-                       indexes: Tensor,
-                       training: bool) -> Tensor:
+                       indexes: Tensor) -> Tensor:
         """
         Refine choices of indexes (this is called iteratively starting from
         all-zeros).
@@ -226,9 +206,6 @@ class MultiKmeansQuantizer(nn.Module):
            x:  A Tensor of shape (B, self.dim) to be approximated.
            indexes: A Tensor of integer type, of shape (B, self.num_codebooks),
                 that contains elements in {0..self.codebook_size-1}
-           training: If true, will take into account self.biases, which will
-                in general make the approximation worse but helps control class
-                diversity.
          Returns:  A (hopefully) set of indexes of shape (B, self.num_codebooks) that
                   will hopefully reduce the error w.r.t. x, better or at least no worse
                   than `indexes`.  This algorithm is not exact, but if the codebooks are
@@ -253,10 +230,6 @@ class MultiKmeansQuantizer(nn.Module):
 
         modified_errs = x_err - cur_centers + all_centers
         modified_neg_sumsq_errs = -((modified_errs ** 2).sum(dim=-1)) # (B, num_codebooks, codebook_size)
-
-        if training and False:
-            # self.biases.unsqueeze(0): (1, num_codebooks, codebook_size)
-            modified_neg_sumsq_errs += self.biases.unsqueeze(0)
 
         indexes = modified_neg_sumsq_errs.argmax(dim=2) # (B, num_codebooks)
         return indexes

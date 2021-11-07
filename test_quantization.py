@@ -32,8 +32,9 @@ class Quantizer(nn.Module):
         self.to_logits = nn.Linear(dim, codebook_size * num_codebooks)
         self.logits_scale = 4
 
-        # we will sometimes interpret to_output as being of shape (num_codebooks, codebook_size, dim);
-        # and similarly with self.to_logits
+        # we will sometimes interpret to_output, which is of shape
+        # (num_codebooks * codebook_size, dim), as being of shape
+        # (num_codebooks, codebook_size, dim); and similarly with self.to_logits
         self.to_output = nn.Parameter(self.to_logits.weight.detach().clone())
 
 
