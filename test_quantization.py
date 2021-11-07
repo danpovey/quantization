@@ -241,8 +241,34 @@ class Quantizer(nn.Module):
         assert indexes.ndim == 2
         return indexes
 
+    def _decode(self, indexes: Tensor) -> Tensor:
+        """
+        Does the (approximate) inverse of _compute_indexes(): constructs from `indexes` the
+        corresponding approximated tensor.
+        Args:
+             indexes: an integer tensor of shape (*, self.num_codebooks), with entries
+                    in {0..self.num_codebooks-1}.
+        Returns: a tensor of shape (*, self.dim), consisting of the sum of the specified
+                cluster centers.
+        """
+        orig_shape = indexes.shape
+        indexes = indexes.reshape(-1, self.num_codebooks)
+        assert indexes.ndim == 2
+        B = indexes.shape[0]
+        # indexes_expanded: (num_codebooks, B, dim)
+        indexes_expanded = indexes.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
+        # to_output_reshaped: (num_codebooks, codebook_size, dim)
+        to_output_reshaped = self.to_output.reshape(self.num_codebooks, self.codebook_size, self.dim)
+        # chosen_codebooks: (num_codebooks, B, dim).
+        chosen_codebooks = torch.gather(to_output_reshaped, dim=1, index=indexes_expanded)
 
-    def compute_ref_loss(self, x: Tensor, refine_indexes_iters: int = 0) -> Tensor:
+        # x_approx: (B, dim), this is the sum of the chosen rows of `to_output`
+        # corresponding to the chosen codebook entries, this would correspond to
+        # the approximated x.
+        x_approx = chosen_codebooks.sum(dim=0)
+        return x_approx.reshape(*orig_shape[:-1], self.dim)
+
+    def compute_loss_deterministic(self, x: Tensor, refine_indexes_iters: int = 0) -> Tensor:
         """
         Compute the loss function, not for optimization, with deterministic indexes using
         argmax not sampling.
@@ -258,32 +284,13 @@ class Quantizer(nn.Module):
                     for already-trained models be between 0 and 1, but could be greater than 1
                     at the start of training.
         """
-        x_reshaped = x.reshape(-1, self.dim)
-        B = x_reshaped.shape[0]
-
-        indexes = self._compute_indexes(x_reshaped, refine_indexes_iters)
-        assert indexes.ndim == 2
-
-        # indexes_expanded: (num_codebooks, B, dim)
-        indexes_expanded = indexes.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
-        # to_output_reshaped: (num_codebooks, codebook_size, dim)
-        to_output_reshaped = self.to_output.reshape(self.num_codebooks, self.codebook_size, self.dim)
-        # chosen_codebooks: (num_codebooks, B, dim).
-        chosen_codebooks = torch.gather(to_output_reshaped, dim=1, index=indexes_expanded)
-
-        # tot_codebooks: (1, B, dim), this is the sum of the chosen rows of `to_output` corresponding
-        # to the chosen codebook entries, this would correspond to the approximated x.
-        tot_codebooks = chosen_codebooks.sum(dim=0, keepdim=True)
-        # tot_error: (1, B, dim), the error of the approximated vs. real x.
-        tot_error = tot_codebooks - x.reshape(1, B, self.dim)
-        # tot_error_sumsq: scalar, total squared error.  only needed for diagnostics.
-        tot_error_sumsq = (tot_error**2).sum()
-
-        x_tot_sumsq = (x ** 2).sum() + 1.0e-20
-
-        rel_tot_error_sumsq = tot_error_sumsq / x_tot_sumsq
-
-        return rel_tot_error_sumsq
+        x = x.reshape(-1, self.dim)
+        indexes = self._compute_indexes(x, refine_indexes_iters)
+        x_approx = self._decode(indexes)
+        # tot_error: (B, dim), the error of the approximated vs. real x.
+        tot_error = x_approx - x
+        rel_reconstruction_loss = (tot_error**2).sum() / ((x ** 2).sum() + 1.0e-20)
+        return rel_reconstruction_loss
 
     def compute_loss(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
@@ -297,7 +304,7 @@ class Quantizer(nn.Module):
                      It is the sum-squared of (x - reconstructed_x) / sum-squared of x, which will
                      for already-trained models be between 0 and 1, but could be greater than 1
                      at the start of training.
-          ref_loss:    A deterministic version of reconstruction_loss, picking the best class; this is
+          loss_deterministic:    A deterministic version of reconstruction_loss, picking the best class; this is
                    for reference but not for optimization.
           entropy_loss:  the "relative entropy difference" between log(codebook_size) and the
                     average entropy of each of the codebooks (taken over all frames together,
@@ -404,7 +411,7 @@ def _test_quantization():
     # Train quantizer.
     frame_entropy_cutoff = torch.tensor(0.3, device=device)
     entropy_scale = 0.02
-    ref_loss_scale = 0.95  # should be in [0..1]
+    det_loss_scale = 0.95  # should be in [0..1]
 
     lr=0.005
     num_iters = 3
@@ -429,18 +436,18 @@ def _test_quantization():
 
             reconstruction_loss, entropy_loss, frame_entropy = quantizer.compute_loss(x)
 
-            ref_loss = quantizer.compute_ref_loss(x, 1)
+            det_loss = quantizer.compute_loss_deterministic(x, 1)
 
             if i % 100 == 0:
-                ref_losses = [ float('%.3f' % quantizer.compute_ref_loss(x, i).item()) for i in range(4) ]
-                print(f"i={i}, ref_loss(0,1,..)={ref_losses}, expected_loss={reconstruction_loss.item():.3f}, "
+                det_losses = [ float('%.3f' % quantizer.compute_loss_deterministic(x, i).item()) for i in range(4) ]
+                print(f"i={i}, det_loss(0,1,..)={det_losses}, expected_loss={reconstruction_loss.item():.3f}, "
                       f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
 
 
             # reconstruction_loss >= 0, equals 0 when reconstruction is exact.
-            tot_loss = reconstruction_loss * (1 - ref_loss_scale)
+            tot_loss = reconstruction_loss * (1 - det_loss_scale)
 
-            tot_loss += ref_loss * ref_loss_scale
+            tot_loss += det_loss * det_loss_scale
 
             # entropy_loss approaches 0 from above, as the entropy of classes
             # approaches its maximum possible.  (this relates to diversity of
