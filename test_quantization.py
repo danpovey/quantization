@@ -241,11 +241,9 @@ class Quantizer(nn.Module):
                      at the start of training.
           ref_loss:    A deterministic version of reconstruction_loss, picking the best class; this is
                    for reference but not for optimization.
-          entropy_loss:  the "entropy difference" between log(codebook_size) and the
+          entropy_loss:  the "relative entropy difference" between log(codebook_size) and the
                     average entropy of each of the codebooks (taken over all frames together,
-                    not individual frames, so it captures the relative frequencies of different
-                    codebook entries).  This will be 0 when all the codebook entries have equal frequency.
-                    Useful to include in the final loss in the early stages of training.
+                    i.e.  (ref_entropy - class_entropy) / ref_entropy, which is a number in [0,1].
           frame_entropy: the average entropy of the codebooks on individual frames, between 0
                     and log(codebook_size).  Training will tend to make this approach 0, but
                     then training gets slow due to small derivatives, so we may want to
@@ -308,7 +306,8 @@ class Quantizer(nn.Module):
         tot_entropy = -((avg_probs * (avg_probs+1.0e-20).log()).sum() / self.num_codebooks)
         # entropy_loss > 0, and approaches 0 when tot_entropy approaches log(self.codebook_size),
         # which is its maximum possible value.
-        entropy_loss = math.log(self.codebook_size) - tot_entropy
+        ref_entropy = math.log(self.codebook_size)
+        entropy_loss = (ref_entropy - tot_entropy) / ref_entropy
 
         return rel_expected_error_sumsq, entropy_loss, frame_entropy
 
@@ -344,7 +343,7 @@ def _test_quantization():
 
     # Train quantizer.
     frame_entropy_cutoff = torch.tensor(0.3, device=device)
-    entropy_scale = 0.01
+    entropy_scale = 0.02
 
     quantizer.apply_mask = False
 
