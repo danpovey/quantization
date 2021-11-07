@@ -502,6 +502,8 @@ class QuantizerTrainer(object):
                                                          step_size=self.phase_one_iters/4,
                                                          gamma=0.5)
 
+    def done(self) -> bool:
+        return self.cur_iter >= 2 * self.phase_one_iters
 
     def step(self, x: torch.Tensor) -> None:
         """
@@ -521,6 +523,7 @@ class QuantizerTrainer(object):
             det_losses = [ float('%.3f' % self.quantizer.compute_loss_deterministic(x, j).item())
                            for j in range(4) ]
             phase = 1 if self.cur_iter <= self.phase_one_iters else 2
+            i = self.cur_iter - self.phase_one_iters if phase > 1 else self.cur_iter
             print(f"phase={phase}/2, iter={i}, det_loss(0,1,..)={det_losses}, "
                   f"expected_loss={reconstruction_loss.item():.3f}, "
                   f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
@@ -539,7 +542,7 @@ class QuantizerTrainer(object):
         self.scheduler.step()
 
         if self.cur_iter == self.phase_one_iters:
-            self.begin_second_phase()
+            self._begin_second_phase()
         self.cur_iter += 1
 
     def _begin_second_phase(self):
@@ -557,7 +560,26 @@ class QuantizerTrainer(object):
 
 
 def _test_quantizer_trainer():
-    pass
+    torch.manual_seed(1)
+    dim = 256
+    device = torch.device('cuda')
+    model = nn.Sequential(
+        nn.Linear(dim, dim),
+        nn.ReLU(),
+        nn.Linear(dim, dim),
+        nn.ReLU(),
+        nn.LayerNorm(dim),
+        nn.Linear(dim, dim),
+    ).to(device)
+    trainer = QuantizerTrainer(dim=dim, bytes_per_frame=4,
+                               device=torch.device('cuda'))
+    B = 600
+    while not trainer.done():
+        x = torch.randn(B, dim, device=device)
+        x = model(x)  + 0.05 * x
+        trainer.step(x)
+    # TODO..
+
 
 def _test_quantization():
     torch.manual_seed(1)
