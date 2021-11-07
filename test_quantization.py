@@ -280,7 +280,7 @@ class Quantizer(nn.Module):
 
 
         # alt_error: (num_codebooks, 1, B, dim) + (num_codebooks, codebook_size, 1, dim) = (num_codebooks, codebook_size, B, dim)
-        # alt_error is a counterfactual: "what if, for this particular codebook, we had chosen this
+        # alt_error answers the question: "what if, for this particular codebook, we had chosen this
         # codebook entry; what would the error be then?"
         alt_error = (tot_error - chosen_codebooks).unsqueeze(1) + to_output_reshaped.unsqueeze(2)
 
@@ -329,7 +329,11 @@ def _test_quantization():
     ).to(device)
 
 
-    # out of codebook_size, num_codebooks = (4, 16), (16, 8), (256, 4), all of which
+    # for easier conversion into bytes, we recommend that codebook_size should
+    # oalways be of the form 2**(2**n), i.e. 2, 4, 16, 256.
+    # num_codebooks should always be a power of 2.
+    #
+    # out of codebook_size, num_codebooks = (2,(4, 16), (16, 8), (256, 4), all of which
     # give 4 bytes per 512-dimensional vector, the best reconstruction loss
     # SET SIZES:
     codebook_size = 4
@@ -353,7 +357,6 @@ def _test_quantization():
             quantizer.parameters(), lr=lr, betas=(0.9, 0.98), eps=1e-9, weight_decay=0.000001
         )
 
-        # We'll choose in the loop how often to step the scheduler.
         scheduler = torch.optim.lr_scheduler.StepLR(optim, step_size=2500, gamma=0.5)
 
         for i in range(10000):
@@ -361,17 +364,16 @@ def _test_quantization():
             x = torch.randn(B, dim, device=device)
             x = model(x)  + 0.05 * x
             # x is the thing we're trying to quantize: the nnet gives it a non-trivial distribution, which is supposed to
-            # emulate a typical output of a neural net.  The "+ 0.1 * x" is a kind of residual term which makes sure
-            # the output is not limited to a subspace or anything too-easy like that.
+            # emulate a typical output of a neural net.  The "+ 0.05 * x" is a kind of residual term which makes sure
+            # the output is not limited to a subspace or anything too-easy like that.  Lots of networks
+            # have residuals, so this is quite realistic.
 
 
             reconstruction_loss, entropy_loss, frame_entropy = quantizer.compute_loss(x)
 
             if i % 100 == 0:
-                ref_loss = quantizer.compute_ref_loss(x)
-                ref_loss1 = quantizer.compute_ref_loss(x, 1)
-                ref_loss2 = quantizer.compute_ref_loss(x, 2)
-                print(f"i={i}, ref_loss{0,1,2}={ref_loss.item():.3f},{ref_loss1.item():.3f},{ref_loss2.item():.3f}, reconstruction_loss={reconstruction_loss.item():.3f}, "
+                ref_losses = [ float('%.3f' % quantizer.compute_ref_loss(x, i).item()) for i in range(4) ]
+                print(f"i={i}, ref_loss{0,1,2,3}={ref_losses}, expected_loss={reconstruction_loss.item():.3f}, "
                       f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
 
 
@@ -396,7 +398,7 @@ def _test_quantization():
 
         if iter + 1 < num_iters:
             quantizer = quantizer.get_product_quantizer()
-            frame_entropy_cutoff = frame_entropy_cutoff * 1.5
+            frame_entropy_cutoff = frame_entropy_cutoff * 1.25
             lr *= 0.5
 
 if __name__ == "__main__":
