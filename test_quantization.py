@@ -511,7 +511,32 @@ class QuantizerTrainer(object):
               x: a Tensor of shape (*, dim) containing the frames of data we are
                  trying to accurately encode.
         """
-        x = x.reshape(-1, quantizer.dim)
+        x = x.reshape(-1, self.quantizer.dim)
+
+        reconstruction_loss, entropy_loss, frame_entropy = self.quantizer.compute_loss(x)
+
+        det_loss = self.quantizer.compute_loss_deterministic(x, 1)
+
+        if self.cur_iter % 100 == 0:
+            det_losses = [ float('%.3f' % self.quantizer.compute_loss_deterministic(x, j).item())
+                           for j in range(4) ]
+            phase = 1 if self.cur_iter <= self.phase_one_iters else 2
+            print(f"phase={phase}/2, iter={i}, det_loss(0,1,..)={det_losses}, "
+                  f"expected_loss={reconstruction_loss.item():.3f}, "
+                  f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
+
+        # reconstruction_loss >= 0, equals 0 when reconstruction is exact.
+        tot_loss = (reconstruction_loss * (1 - self.det_loss_scale) +
+                    det_loss * self.det_loss_scale +
+                    entropy_loss * self.entropy_scale)
+        # We want to maximize frame_entropy if it is less than frame_entropy_cutoff.
+        tot_loss -= torch.minimum(self.frame_entropy_cutoff,
+                                  frame_entropy)
+
+        tot_loss.backward()
+        self.optim.step()
+        self.optim.zero_grad()
+        self.scheduler.step()
 
         if self.cur_iter == self.phase_one_iters:
             self.begin_second_phase()
@@ -526,11 +551,13 @@ class QuantizerTrainer(object):
         self.lr *= 0.5
         self._init_optimizer()
 
-
     def get_quantizer(self) -> Quantizer:
         assert self.cur_iter >= 2 * self.phase_one_iters
         return self.quantizer
 
+
+def _test_quantizer_trainer():
+    pass
 
 def _test_quantization():
     torch.manual_seed(1)
@@ -645,4 +672,5 @@ def _test_quantization():
         lr *= 0.5
 
 if __name__ == "__main__":
+    _test_quantizer_trainer()
     _test_quantization()
