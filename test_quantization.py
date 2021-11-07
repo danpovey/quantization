@@ -241,7 +241,7 @@ class Quantizer(nn.Module):
         assert indexes.ndim == 2
         return indexes
 
-    def _decode(self, indexes: Tensor) -> Tensor:
+    def decode(self, indexes: Tensor) -> Tensor:
         """
         Does the (approximate) inverse of _compute_indexes(): constructs from `indexes` the
         corresponding approximated tensor.
@@ -286,7 +286,7 @@ class Quantizer(nn.Module):
         """
         x = x.reshape(-1, self.dim)
         indexes = self._compute_indexes(x, refine_indexes_iters)
-        x_approx = self._decode(indexes)
+        x_approx = self.decode(indexes)
         # tot_error: (B, dim), the error of the approximated vs. real x.
         tot_error = x_approx - x
         rel_reconstruction_loss = (tot_error**2).sum() / ((x ** 2).sum() + 1.0e-20)
@@ -304,8 +304,6 @@ class Quantizer(nn.Module):
                      It is the sum-squared of (x - reconstructed_x) / sum-squared of x, which will
                      for already-trained models be between 0 and 1, but could be greater than 1
                      at the start of training.
-          loss_deterministic:    A deterministic version of reconstruction_loss, picking the best class; this is
-                   for reference but not for optimization.
           entropy_loss:  the "relative entropy difference" between log(codebook_size) and the
                     average entropy of each of the codebooks (taken over all frames together,
                     i.e.  (ref_entropy - class_entropy) / ref_entropy, which is a number in [0,1].
@@ -340,7 +338,6 @@ class Quantizer(nn.Module):
         tot_error = tot_codebooks - x.reshape(1, B, self.dim)
         # tot_error_sumsq: scalar, total squared error.  only needed for diagnostics.
         tot_error_sumsq = (tot_error**2).sum()
-
 
         # alt_error: (num_codebooks, 1, B, dim) + (num_codebooks, codebook_size, 1, dim) = (num_codebooks, codebook_size, B, dim)
         # alt_error answers the question: "what if, for this particular codebook, we had chosen this
