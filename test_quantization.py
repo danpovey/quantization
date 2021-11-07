@@ -138,6 +138,17 @@ class Quantizer(nn.Module):
         shape[-1] = -1
         return indices.reshape(*shape)
 
+    def get_all_permutations(self, n: int, device: torch.device) -> Tensor:
+        """
+        For a number n, returns a Tensor of float and shape (2**n, n) whose rows are all
+        distinct combinations of 0.0 and 1.0.
+        """
+        p = 2 ** n
+        arange = torch.arange(p, device=device)
+        powers = 2 ** torch.arange(n, device=device)
+        ans = ((arange.unsqueeze(1) / powers.unsqueeze(0)).to(torch.int32) % 2 == 0).to(torch.float)
+        return ans
+
     def refine_indexes(self,
                        x: Tensor,
                        indexes: Tensor) -> Tensor:
@@ -174,7 +185,51 @@ class Quantizer(nn.Module):
         modified_errs = x_err - cur_centers + all_centers
         modified_neg_sumsq_errs = -((modified_errs ** 2).sum(dim=-1)) # (B, num_codebooks, codebook_size)
 
-        indexes = modified_neg_sumsq_errs.argmax(dim=2) # (B, num_codebooks)
+        if self.num_codebooks <= 8:
+            # put -infinity in modified_neg_sumsq_errs in locations corresponding to the current "index",
+            # to disallow them (we'll consider those later, separately).
+            src = torch.full((B, self.num_codebooks, self.codebook_size), float('-inf'), device=indexes.device)
+            modified_neg_sumsq_errs.scatter_(dim=2, index=indexes.unsqueeze(-1), src=src)
+
+            # proposed_indexes contains the best alternative to the index in 'indexes'
+            proposed_indexes = modified_neg_sumsq_errs.argmax(dim=2) # (B, num_codebooks)
+
+            # proposed_indexes_expanded: (B, self.num_codebooks, 1, self.dim)
+            proposed_indexes_expanded = proposed_indexes.unsqueeze(-1).unsqueeze(-1).expand(B, self.num_codebooks, 1, self.dim)
+
+            # proposed_new_centers: (B, self.num_codebooks, 1, self.dim), the same
+            # shape as cur_centers but containing the centers corresponding to 'proposed_indexes'
+            proposed_new_centers = torch.gather(centers_expanded, dim=2, index=proposed_indexes_expanded)
+            # proposed_deltas, of shape (B, num_codebooks, 1, dim), contains the
+            # change in the prediction if we were to accept the best alternative index for
+            # each codebook.
+            proposed_deltas = proposed_new_centers - cur_centers
+            # proposed_deltas: (B, dim, num_codebooks)
+            proposed_deltas = proposed_deltas.transpose(1, 3).reshape(B, self.dim,
+                                                                      self.num_codebooks)
+            # perm: (2**self.num_codebooks, num_codebooks)
+            perm = self.get_all_permutations(self.num_codebooks, indexes.device)
+
+            # all_possible_deltas: (B, 2**num_codebooks, dim)
+            all_possible_deltas = torch.matmul(proposed_deltas, perm.t()).transpose(1,2)
+            assert all_possible_deltas.shape == (B, 2**self.num_codebooks, self.dim)
+            x_err_squeezed = x_err.squeeze(1) # (B, 1, dim)
+            all_possible_x_errs = x_err_squeezed + all_possible_deltas  # (B, 2**num_codebooks, dim)
+            all_possible_x_errs_sumsq = (all_possible_x_errs**2).sum(dim=-1) # (B, 2**num_codebooks)
+            perm_rows = (-all_possible_x_errs_sumsq).argmax(dim=1) # (B,)
+            assert perm_rows.shape == (B,)
+
+            # selected_perm_rows will be of shape (B, num_codebooks), with a 1
+            # in each position where we want to select the proposed change.
+            selected_perm_rows = torch.index_select(input=perm.to(torch.int32),
+                                                    dim=0,
+                                                    index=perm_rows)
+            assert selected_perm_rows.shape == (B, self.num_codebooks)
+
+            indexes = (proposed_indexes * selected_perm_rows) + (indexes * (1 - selected_perm_rows))
+        else:
+            indexes = modified_neg_sumsq_errs.argmax(dim=2) # (B, num_codebooks)
+
         assert indexes.ndim == 2
         return indexes
 
@@ -332,13 +387,15 @@ def _test_quantization():
     # oalways be of the form 2**(2**n), i.e. 2, 4, 16, 256.
     # num_codebooks should always be a power of 2.
     #
-    # out of codebook_size, num_codebooks = (2,(4, 16), (16, 8), (256, 4), all of which
-    # give 4 bytes per 512-dimensional vector, the best reconstruction loss
     # SET SIZES:
+    # We start with codebook_size, num_codebooks = (4, 16), but after training
+    # the model we expand it to (16, 8), the train more, then expand to
+    # (256, 4), then train more.
     codebook_size = 4
     num_codebooks = 16
 
-    quantizer = Quantizer(dim=dim, codebook_size=codebook_size, num_codebooks=num_codebooks).to(device)
+    quantizer = Quantizer(dim=dim, codebook_size=codebook_size,
+                          num_codebooks=num_codebooks).to(device)
 
 
     # Train quantizer.
@@ -371,7 +428,12 @@ def _test_quantization():
             reconstruction_loss, entropy_loss, frame_entropy = quantizer.compute_loss(x)
 
             if i % 100 == 0:
-                ref_losses = [ float('%.3f' % quantizer.compute_ref_loss(x, i).item()) for i in range(4) ]
+                # only do at most 2 iterations of refining clusters if
+                # num_codebooks <= 8, because in this case we use a more exact
+                # algorithm for which we have never seen an improvement after
+                # the 2st iteration of refinement.
+                n = 3 if num_codebooks <= 8 else 4
+                ref_losses = [ float('%.3f' % quantizer.compute_ref_loss(x, i).item()) for i in range(n) ]
                 print(f"i={i}, ref_loss{0,1,2,3}={ref_losses}, expected_loss={reconstruction_loss.item():.3f}, "
                       f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
 
