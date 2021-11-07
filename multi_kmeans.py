@@ -31,10 +31,6 @@ class MultiKmeansQuantizer(nn.Module):
 
         self.centers = nn.Parameter((dim ** -0.5) * torch.randn(num_codebooks, codebook_size, dim))
 
-        # these are biases on log-likes, used in training when we take into account
-        # the entropy of the class distribution.
-        self.biases = nn.Parameter(torch.zeros(num_codebooks, codebook_size))
-
 
         # will be exponentiated to become a scale on a distribution, will be trained
         # to get a target frame entropy during training.
@@ -64,13 +60,7 @@ class MultiKmeansQuantizer(nn.Module):
                     for k_in2 in range(self.codebook_size):
                         k_out = k_in1 * self.codebook_size + k_in2
                         ans.centers[c_out,k_out,:] = self.centers[c_in1,k_in1,:] + self.centers[c_in2,k_in2,:]
-                        ans.biases[c_out,k_out] = self.biases[c_in1,k_in1] + self.biases[c_in2,k_in2]
         return ans
-
-    def get_initial_centers(self, x: Tensor) -> Tensor:
-        """
-        Gets an initial set of indexes that encode
-        """
 
     def _reset_parameters(self):
         with torch.no_grad():
@@ -90,41 +80,6 @@ class MultiKmeansQuantizer(nn.Module):
         else:
             return self.to_output
 
-
-    def forward(x: Tensor, as_bytes: bool = False) -> Tensor:
-        """
-        Compute the quantized output, that can be used to reconstruct x.
-
-        Args:
-                x: the Tensor to quantize, of shape (*, dim)
-        as_bytes:  if True, the quantized output will be returned as a byte
-                 array, combining two codes into a single byte if
-                 codebook_size <= 16.
-
-        Returns:  if as_bytes == False, returns a torch.LongTensor of shape (*, num_codebooks);
-                  if as_bytes == True, returns a Tensor of dtype=torch.uint8, of
-                  (*, num_codebooks/2) if codebook_size <= 16; else, require
-                  that codebook_size <= 256, and result will be of shape
-                  (*, num_codebooks).
-        """
-        logits = self._logits(x)
-
-        # reshape logits to (B, self.num_codebooks, self.codebook_size) where B is the
-        # product of all dimensions of x except the last one.
-        tot_codebook_size = self.num_codebooks * self.codebook_size
-        logits = logits.reshape(-1, tot_codebook_size)
-        B = logits.shape[0]
-        indices = torch.distributions.categorical.Categorical(logits=logits).sample()
-        # indices is of shape (B, self.num_codebooks)
-
-        if as_bytes:
-            if self.codebook_size <= 16:
-                indices = indices.transpose(0, 1)  # easiest to index 1st dim.
-                indices = (indices[::2] * 16 + indices[1::2]).to(torch.uint8).transpose(0, 1).contiguous()
-
-        shape = list(x.shape)
-        shape[-1] = -1
-        return indices.reshape(*shape)
 
     def compute_ref_loss(self, x: Tensor) -> Tensor:
         """
@@ -170,10 +125,9 @@ class MultiKmeansQuantizer(nn.Module):
 
         return rel_tot_error_sumsq
 
-    def encode_training(self, x: Tensor, num_iters: int = 4) -> Tuple[Tensor, Tensor, Tensor]:
+    def forward(self, x: Tensor, num_iters: int = 4) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
-        Version of encode() that is to be used during training, that supports an entropy term
-        that can be used to balance class probabilities.
+        Function to be used during training, that gives various loss terms.
 
         Args:
               x: a Tensor of shape (*, dim) to be approximated
@@ -188,6 +142,9 @@ class MultiKmeansQuantizer(nn.Module):
                    approximately the same probability of being chosen.
             frame_entropy:  average per-frame entropy of distributions from which we
                   selected the indexes.
+            reconstruction_loss:  an expectation over the sum-squared error (taken over
+                   the choices of indexes on the last iteration of refining indexes),
+                   divided by the sum-squared of x.
         """
         assert x.shape[-1] == self.dim
         x_reshaped = x.reshape(-1, self.dim)
@@ -195,14 +152,14 @@ class MultiKmeansQuantizer(nn.Module):
 
         indexes = torch.randint(self.codebook_size - 1, (B, self.num_codebooks), device=x.device)
 
-        for iter in range(num_iters):
-            indexes, frame_entropy, entropy_loss = self.refine_indexes_stochastic(x, indexes)
+        for i in range(num_iters):
+            indexes, entropy_loss, frame_entropy, reconstruction_loss = self.refine_indexes_stochastic(x, indexes)
             if False:
                 avg_loss = ((self.decode(indexes) - x) ** 2).sum() / ((x ** 2).sum() + 1e-20)
-                print(f"iter={iter}, avg_loss={avg_loss.item():.3f}")
+                print(f"iter={i}, avg_loss={avg_loss.item():.3f}")
 
         indexes = indexes.reshape(*x.shape[:-1], self.num_codebooks)
-        return indexes, entropy_loss, frame_entropy
+        return indexes, entropy_loss, frame_entropy, reconstruction_loss
 
 
     def encode(self, x: Tensor, num_iters: int = 4) -> Tensor:
@@ -221,7 +178,7 @@ class MultiKmeansQuantizer(nn.Module):
 
         indexes = torch.zeros(B, self.num_codebooks, dtype=torch.long, device=x.device)
 
-        for iter in range(num_iters):
+        for _ in range(num_iters):
             indexes = self.refine_indexes(x, indexes, training=False)
 
         indexes = indexes.reshape(*x.shape[:-1], self.num_codebooks)
@@ -307,7 +264,7 @@ class MultiKmeansQuantizer(nn.Module):
 
     def refine_indexes_stochastic(self,
                                   x: Tensor,
-                                  indexes: Tensor) -> Tensor:
+                                  indexes: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Refine choices of indexes (this is called iteratively starting from
         all-zeros).  This version is stochastic.
@@ -318,7 +275,7 @@ class MultiKmeansQuantizer(nn.Module):
            training: If true, will take into account self.biases, which will
                 in general make the approximation worse but helps control class
                 diversity.
-         Returns:  (new_indexes, frame_entropy, entropy_loss), where:
+         Returns:  (new_indexes, entropy_loss, frame_entropy, reconstruction_loss), where:
                 new_indexes: (hopefully) set of indexes of shape (B, self.num_codebooks) that
                   will hopefully reduce the error w.r.t. x, better or at least no worse
                   than `indexes`.  This algorithm is not exact, but if the codebooks are
@@ -331,70 +288,71 @@ class MultiKmeansQuantizer(nn.Module):
                   frequencies.
                 frame_entropy: the average per-frame entropy of the distribution from
                   which new_indexes was sampled.
+                reconstruction_loss:  an expectation over the sum-squared error (taken over
+                   the choices of indexes on the last iteration of refining indexes),
+                   divided by the sum-squared of x.
 
         """
         B = indexes.shape[0]
         # indexes_expanded has shape (B, self.num_codebooks, 1, self.dim)
         indexes_expanded = indexes.unsqueeze(-1).unsqueeze(-1).expand(B, self.num_codebooks, 1, self.dim)
+        assert indexes_expanded.shape == (B, self.num_codebooks, 1, self.dim)
         # centers_expanded has shape (B, self.num_codebooks, self.codebook_size, self.dim)
         centers_expanded = self.centers.unsqueeze(0).expand(B, self.num_codebooks, self.codebook_size, self.dim)
+        assert centers_expanded.shape == (B, self.num_codebooks, self.codebook_size, self.dim)
 
         # cur_centers: (B, self.num_codebooks, 1, self.dim)
         cur_centers = torch.gather(centers_expanded, dim=2, index=indexes_expanded)
+        assert cur_centers.shape == (B, self.num_codebooks, 1, self.dim)
         # x_err is of shape (B, 1, 1, self.dim), it is the current error of the approximation vs. x.
         x_err = cur_centers.sum(dim=1, keepdim=True) - x.unsqueeze(1).unsqueeze(2)
+        assert x_err.shape == (B, 1, 1, self.dim)
 
         all_centers = self.centers.unsqueeze(0) # (1, num_codebooks, codebook_size, dim)
+        assert all_centers.shape == (1, self.num_codebooks, self.codebook_size, self.dim)
 
         # TODO: get modified_neg_sumsq_errs by a more efficient expression.
 
-        modified_errs = x_err - cur_centers + all_centers
-        modified_neg_sumsq_errs = -((modified_errs ** 2).sum(dim=-1)) # (B, num_codebooks, codebook_size)
+        # modified_errs [b][i][j] is the error of (prediction - x) assuming we replaced
+        # the i'th codebook's entry with codebook index j.
+        modified_errs = x_err - cur_centers + all_centers             # (B, num_codebooks, codebook_size, dim)
+        assert modified_errs.shape == centers_expanded.shape
+        modified_sumsq_errs = ((modified_errs ** 2).sum(dim=-1)) # (B, num_codebooks, codebook_size)
 
-        # self.biases.unsqueeze(0): (1, num_codebooks, codebook_size)
-        modified_neg_sumsq_errs += self.biases.unsqueeze(0)
 
         # 10.0 is just to make it equilibriate faster.
         # we only want the derivative for frame_entropy to affect frame_entropy_scale.
-        modified_neg_sumsq_errs_detached = modified_neg_sumsq_errs.detach() * (10.0 * self.frame_entropy_scale).exp()
+        scaled_neg_sumsq_errs_detached = modified_sumsq_errs.detach() * -(10.0 * self.frame_entropy_scale).exp()
 
         # codebook_logprobs_detached: (B, num_codebooks, codebook_size)
-        codebook_logprobs_detached = modified_neg_sumsq_errs_detached.log_softmax(dim=-1)
+        codebook_logprobs_detached = scaled_neg_sumsq_errs_detached.log_softmax(dim=-1)
         # indexes: (B, num_codebooks)
         indexes = torch.distributions.categorical.Categorical(logits=codebook_logprobs_detached).sample()
-
-
-        codebook_probs_detached = modified_neg_sumsq_errs_detached.softmax(dim=-1)
+        codebook_probs_detached = scaled_neg_sumsq_errs_detached.softmax(dim=-1)
         avg_frame_entropy = -(codebook_logprobs_detached * codebook_probs_detached).sum(dim=-1).mean()
 
 
-        modified_neg_sumsq_errs = modified_neg_sumsq_errs * (10.0 * self.frame_entropy_scale).exp()
-        codebook_probs = modified_neg_sumsq_errs.softmax(dim=-1)
+        # this time, detach only the frame_entropy_scale.  we're computing the expected sum-squared
+        # loss.
+        # (B, num_codebooks, codebook_size)
+        scaled_neg_sumsq_errs = modified_sumsq_errs * -(10.0 * self.frame_entropy_scale.detach()).exp()
+        codebook_probs = scaled_neg_sumsq_errs.softmax(dim=-1)  # (B, num_codebooks, codebook_size)
+        # the second term below can be thought of as compensating  for things that are repeated multiple times.
+        expected_sumsq_term1 = (codebook_probs * modified_sumsq_errs).sum()
+        #expected_sumsq_term2 = (self.num_codebooks // 2) * (x_err ** 2).sum()
+
+        expected_sumsq = expected_sumsq_term1 / self.num_codebooks
+
+
+        #assert expected_sumsq > 0
         avg_probs = codebook_probs.mean(dim=0)  # (num_codebooks, codebook_size)
         class_entropy = -(avg_probs * (avg_probs + 1.0e-20).log()).sum(dim=1).mean()
 
-
         entropy_loss = math.log(self.codebook_size) - class_entropy
+        reconstruction_loss = expected_sumsq / (x ** 2).sum()
+        return indexes, entropy_loss, avg_frame_entropy, reconstruction_loss
 
-        return indexes, avg_frame_entropy, entropy_loss
 
-
-
-class _ZerosWithDerivLike(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: Tensor) -> Tensor:
-        return torch.zeros_like(x)
-
-    @staticmethod
-    def backward(ctx, output_deriv: Tensor) -> Tensor:
-        return output_deriv
-
-def zeros_with_deriv_like(x: Tensor) -> Tensor:
-    """
-    Returns torch.zeros_like(x), but for backprop purposes it will be as if
-    you had returned x.
-    """
-    return _ZerosWithDerivLike.apply(x)
 
 
 def _test_quantization():
@@ -420,10 +378,9 @@ def _test_quantization():
     quantizer = MultiKmeansQuantizer(dim=dim, codebook_size=codebook_size,
                                      num_codebooks=num_codebooks).to(device)
 
+    target_frame_entropy = 0.2
 
-    target_frame_entropy = 0.3
-
-    entropy_scale = 0.0001
+    entropy_scale = 1.0e-07
     lr=0.001
     num_iters = 3
     for iter in range(num_iters):
@@ -445,9 +402,9 @@ def _test_quantization():
             # the output is not limited to a subspace or anything too-easy like that.
 
 
-            indexes, entropy_loss, frame_entropy = quantizer.encode_training(x)
+            indexes, entropy_loss, frame_entropy, rel_err = quantizer(x)
 
-            rel_err = ((x - quantizer.decode(indexes)) ** 2).sum() / ((x ** 2).sum() + 1.0e-20)
+            #rel_err = ((x - quantizer.decode(indexes)) ** 2).sum() / ((x ** 2).sum() + 1.0e-20)
 
             if i % 100 == 0:
                 ref_loss = ((x - quantizer.decode(quantizer.encode(x))) ** 2).sum() / ((x ** 2).sum() + 1.0e-20)
