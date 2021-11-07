@@ -472,6 +472,15 @@ class QuantizerTrainer(object):
                is smaller than this you may benefit from a larger phase_one_iters and a
                smaller learning rate.
           lr: The initial learning rate.
+
+        This object trains a Quantizer.  You can use it as follows:
+
+          trainer = QuantizerTrainer(...)
+          while not trainer.done():
+             # let x be some tensor of shape (*, dim), that you will train on
+             # (should not be the same on each minibatch)
+             trainer.step(x)
+          quantizer = trainer.get_quantizer()
         """
         super(QuantizerTrainer, self).__init__()
         assert bytes_per_frame in [1,2,4,8,16,32]
