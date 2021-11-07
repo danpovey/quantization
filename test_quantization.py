@@ -31,7 +31,7 @@ class Quantizer(nn.Module):
         self.to_logits = nn.Linear(dim, codebook_size * num_codebooks)
         self.logits_scale = 4
 
-        # we will sometimes interpret to_output, which is of shape
+        # we will sometimes interpret self.centers, which is of shape
         # (num_codebooks * codebook_size, dim), as being of shape
         # (num_codebooks, codebook_size, dim); and similarly with self.to_logits
         self.centers = nn.Parameter(self.to_logits.weight.detach().clone())
@@ -65,7 +65,7 @@ class Quantizer(nn.Module):
                         row_out = new_codebook_size * c_out + k_out
                         ans.to_logits.weight[row_out,:] = self.to_logits.weight[row_in1] + self.to_logits.weight[row_in2]
                         ans.to_logits.bias[row_out] = self.to_logits.bias[row_in1] + self.to_logits.bias[row_in2]
-                        ans.to_output[row_out,:] = self.centers[row_in1] + self.centers[row_in2]
+                        ans.centers[row_out,:] = self.centers[row_in1] + self.centers[row_in2]
         return ans
 
     def _logits(self, x: Tensor) -> Tensor:
@@ -476,8 +476,8 @@ def _test_quantization():
     # We start with codebook_size, num_codebooks = (4, 16), but after training
     # the model we expand it to (16, 8), the train more, then expand to
     # (256, 4), then train more.
-    codebook_size = 4
-    num_codebooks = 16
+    codebook_size = 16
+    num_codebooks = 8
 
     quantizer = Quantizer(dim=dim, codebook_size=codebook_size,
                           num_codebooks=num_codebooks).to(device)
@@ -489,8 +489,8 @@ def _test_quantization():
     det_loss_scale = 0.95  # should be in [0..1]
 
     lr=0.005
-    num_iters = 3
-    for iter in range(num_iters):
+    while True:
+        # we'll break from this loop when quantizer.codebook_size >= 256.
 
         # training quantizer, not model.
         optim = torch.optim.Adam(
@@ -560,10 +560,11 @@ def _test_quantization():
               f"frame_entropy_cutoff={frame_entropy_cutoff.item():.3f}, entropy_scale={entropy_scale}, "
               f"det_loss_scale={det_loss_scale}")
 
-        if iter + 1 < num_iters:
-            quantizer = quantizer.get_product_quantizer()
-            frame_entropy_cutoff = frame_entropy_cutoff * 1.25
-            lr *= 0.5
+        if quantizer.codebook_size >= 256:
+            break
+        quantizer = quantizer.get_product_quantizer()
+        frame_entropy_cutoff = frame_entropy_cutoff * 1.25
+        lr *= 0.5
 
 if __name__ == "__main__":
     _test_quantization()
