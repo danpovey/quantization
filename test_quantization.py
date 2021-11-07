@@ -364,9 +364,13 @@ class Quantizer(nn.Module):
         # tot_error_sumsq: scalar, total squared error.  only needed for diagnostics.
         tot_error_sumsq = (tot_error**2).sum()
 
-        # alt_error: (num_codebooks, 1, B, dim) + (num_codebooks, codebook_size, 1, dim) = (num_codebooks, codebook_size, B, dim)
-        # alt_error answers the question: "what if, for this particular codebook, we had chosen this
-        # codebook entry; what would the error be then?"
+        # The two args to _compute_diff_sumsq() below are:
+        #    a, of shape: (num_codebooks, 1, B, dim)
+        #    b, of shape: (num_codebooks, codebook_size, 1, dim)
+        # .. and the answer, which is equivalent to ((a+b)**2).sum(dim-1), is of shape
+        #    (num_codebooks, codebook_size, B)
+        # alt_error_sumsq answers the question: "what if, for this particular codebook, we had chosen this
+        # codebook entry; what would the sum-squared error be then?"
         alt_error_sumsq = self._compute_diff_sumsq((tot_error - chosen_codebooks).unsqueeze(1),
                                                    to_output_reshaped.unsqueeze(2))
 
