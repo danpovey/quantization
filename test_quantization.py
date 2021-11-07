@@ -180,6 +180,30 @@ class Quantizer(nn.Module):
         ab = ab.squeeze(1).transpose(1, 2) # (i, j, j)
         return a2 + b2 + 2 * ab
 
+    def _compute_diff_sumsq2(self,
+                            a: Tensor,
+                            b: Tensor) -> Tensor:
+        """
+        This is utility function that computes a particular expression in an optimized
+        way.
+
+        Args:
+           a: a Tensor of shape (1, j  k, l)
+           b: a Tensor of shape (i, j, 1, l)
+        Returns:
+           a Tensor of shape (i, j, k), that is equal to ((a + b)**2).sum(dim=-1)
+        """
+        assert a.ndim == 4 and a.shape[0] == 1
+        assert b.ndim == 4 and b.shape[2] == 1
+
+        a2 = (a ** 2).sum(dim=-1)   # (1, j, k)
+        b2 = (b ** 2).sum(dim=-1)   # (i, j, 1)
+        b_permuted = b.permute(2, 1, 3, 0) # (1, j, l, i)
+        ab = torch.matmul(a, b_permuted)  # (1, j, k, i)
+        ab = ab.squeeze(0).permute(2, 0, 1) # (i, j, k)
+        return a2 + b2 + 2 * ab
+
+
     def _refine_indexes(self,
                        x: Tensor,
                        indexes: Tensor) -> Tensor:
@@ -213,8 +237,17 @@ class Quantizer(nn.Module):
 
         # TODO: get modified_neg_sumsq_errs by a more efficient expression.
 
-        modified_errs = x_err - cur_centers + all_centers
-        modified_neg_sumsq_errs = -((modified_errs ** 2).sum(dim=-1)) # (B, num_codebooks, codebook_size)
+        # Below, the 2 args of compute_diff_sumsq2 are:
+        #  a: of shape (1, self.num_codebooks, self.codebook_size, self.dim)
+        #  b: of shape (B, self.num_codebooks, 1, self.dim)
+        # The answer, equivalent to ((a+b)**2).sum(dim=-1), is
+        # of shape (B, self.num_codebooks, self.codebook_size).
+        modified_neg_sumsq_errs = -self._compute_diff_sumsq2(all_centers,
+                                                             x_err - cur_centers)
+
+        # The above is an optimization of:
+        # modified_errs = x_err - cur_centers + all_centers
+        # modified_neg_sumsq_errs = -((modified_errs ** 2).sum(dim=-1))
 
         if self.num_codebooks <= 8:
             # put -infinity in modified_neg_sumsq_errs in locations corresponding to the current "index",
