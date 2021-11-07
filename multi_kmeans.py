@@ -160,7 +160,7 @@ class MultiKmeansQuantizer(nn.Module):
         indexes = torch.zeros(B, self.num_codebooks, dtype=torch.long, device=x.device)
 
         for _ in range(num_iters):
-            indexes = self.refine_indexes(x, indexes, training=False)
+            indexes = self.refine_indexes(x, indexes)
 
         indexes = indexes.reshape(*x.shape[:-1], self.num_codebooks)
         return indexes
@@ -206,7 +206,7 @@ class MultiKmeansQuantizer(nn.Module):
            x:  A Tensor of shape (B, self.dim) to be approximated.
            indexes: A Tensor of integer type, of shape (B, self.num_codebooks),
                 that contains elements in {0..self.codebook_size-1}
-         Returns:  A (hopefully) set of indexes of shape (B, self.num_codebooks) that
+         Returns:  A tensor of indexes of shape (B, self.num_codebooks) that
                   will hopefully reduce the error w.r.t. x, better or at least no worse
                   than `indexes`.  This algorithm is not exact, but if the codebooks are
                   fairly orthogonal it should work fine.   If they are not fairly orthogonal
@@ -249,7 +249,7 @@ class MultiKmeansQuantizer(nn.Module):
                 in general make the approximation worse but helps control class
                 diversity.
          Returns:  (new_indexes, entropy_loss, frame_entropy, reconstruction_loss), where:
-                new_indexes: (hopefully) set of indexes of shape (B, self.num_codebooks) that
+                new_indexes: A tensor of indexes of shape (B, self.num_codebooks) that
                   will hopefully reduce the error w.r.t. x, better or at least no worse
                   than `indexes`.  This algorithm is not exact, but if the codebooks are
                   fairly orthogonal it should work fine.   If they are not fairly orthogonal

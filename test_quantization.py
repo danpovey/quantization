@@ -138,13 +138,56 @@ class Quantizer(nn.Module):
         shape[-1] = -1
         return indices.reshape(*shape)
 
-    def compute_ref_loss(self, x: Tensor) -> Tensor:
+    def refine_indexes(self,
+                       x: Tensor,
+                       indexes: Tensor) -> Tensor:
+        """
+        Refine choices of indexes, minimizing sum-squared loss.  Note, this is not guaranteed
+        not not increase the sum-squared loss, but works OK in practice.
+
+        Args:
+           x:  A Tensor of shape (B, self.dim) to be approximated.
+           indexes: A Tensor of integer type, of shape (B, self.num_codebooks),
+                that contains elements in {0..self.codebook_size-1}
+         Returns:  A tensor of indexes of shape (B, self.num_codebooks) that
+                  will hopefully reduce the error w.r.t. x, better or at least no worse
+                  than `indexes`.  This algorithm is not exact, but if the codebooks are
+                  fairly orthogonal it should work fine.   If they are not fairly orthogonal
+                  it may not optimize well, but hopefully the codebooks will then learn
+                  to be more orthogona..
+        """
+        B = indexes.shape[0]
+        # indexes_expanded has shape (B, self.num_codebooks, 1, self.dim)
+        indexes_expanded = indexes.unsqueeze(-1).unsqueeze(-1).expand(B, self.num_codebooks, 1, self.dim)
+        # all_centers: (1, num_codebooks, codebook_size, dim)
+        all_centers = self.to_output.reshape(1, self.num_codebooks, self.codebook_size, self.dim)
+        # centers_expanded has shape (B, self.num_codebooks, self.codebook_size, self.dim)
+        centers_expanded = all_centers.expand(B, self.num_codebooks, self.codebook_size, self.dim)
+
+        # cur_centers: (B, self.num_codebooks, 1, self.dim)
+        cur_centers = torch.gather(centers_expanded, dim=2, index=indexes_expanded)
+        # x_err is of shape (B, 1, 1, self.dim), it is the current error of the approximation vs. x.
+        x_err = cur_centers.sum(dim=1, keepdim=True) - x.unsqueeze(1).unsqueeze(2)
+
+        # TODO: get modified_neg_sumsq_errs by a more efficient expression.
+
+        modified_errs = x_err - cur_centers + all_centers
+        modified_neg_sumsq_errs = -((modified_errs ** 2).sum(dim=-1)) # (B, num_codebooks, codebook_size)
+
+        indexes = modified_neg_sumsq_errs.argmax(dim=2) # (B, num_codebooks)
+        assert indexes.ndim == 2
+        return indexes
+
+
+    def compute_ref_loss(self, x: Tensor, refine_indexes_iters: int = 0) -> Tensor:
         """
         Compute the loss function, not for optimization, with deterministic indexes using
         argmax not sampling.
 
         Args:
                 x: the Tensor to quantize, of shape (*, dim)
+               refine_indexes_iters: number of iterations to refine the indexes
+                 from their 1st value.
 
         Returns:   a scalar torch.Tensor containing the relative sum-squared
                     reconstruction loss.
@@ -152,15 +195,17 @@ class Quantizer(nn.Module):
                     for already-trained models be between 0 and 1, but could be greater than 1
                     at the start of training.
         """
-        logits = self._logits(x)
-
-        # reshape logits to (B, self.num_codebooks, self.codebook_size) where B is the
-        # product of all dimensions of x except the last one.
-        logits = logits.reshape(-1, self.num_codebooks, self.codebook_size)
-        B = logits.shape[0]
+        x_reshaped = x.reshape(-1, self.dim)
+        B = x_reshaped.shape[0]
+        logits = self._logits(x_reshaped)
+        logits = logits.reshape(B, self.num_codebooks, self.codebook_size)
 
         # indices: (B, self.num_codebooks)
         indices = torch.argmax(logits, dim=-1)
+        for _ in range(refine_indexes_iters):
+            indices = self.refine_indexes(x_reshaped, indices)
+        assert indices.ndim == 2
+
         # indexes_expanded: (num_codebooks, B, dim)
         indices_expanded = indices.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
         # to_output_reshaped: (num_codebooks, codebook_size, dim)
@@ -324,7 +369,9 @@ def _test_quantization():
 
             if i % 100 == 0:
                 ref_loss = quantizer.compute_ref_loss(x)
-                print(f"i={i}, ref_loss={ref_loss.item():.3f}, reconstruction_loss={reconstruction_loss.item():.3f}, "
+                ref_loss1 = quantizer.compute_ref_loss(x, 1)
+                ref_loss2 = quantizer.compute_ref_loss(x, 2)
+                print(f"i={i}, ref_loss{0,1,2}={ref_loss.item():.3f},{ref_loss1.item():.3f},{ref_loss2.item():.3f}, reconstruction_loss={reconstruction_loss.item():.3f}, "
                       f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
 
 
@@ -345,7 +392,7 @@ def _test_quantization():
             optim.zero_grad()
             scheduler.step()
 
-        print(f"... for codebook_size={quantizer.codebook_size}, num_codebooks={quantizer.num_codebooks}, frame_entropy_cutoff={frame_entropy_cutoff.item()}, entropy_scale={entropy_scale}")
+        print(f"... for codebook_size={quantizer.codebook_size}, num_codebooks={quantizer.num_codebooks}, frame_entropy_cutoff={frame_entropy_cutoff.item():.3f}, entropy_scale={entropy_scale}")
 
         if iter + 1 < num_iters:
             quantizer = quantizer.get_product_quantizer()
