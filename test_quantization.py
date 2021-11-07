@@ -5,12 +5,12 @@ from torch import nn
 from torch import Tensor
 from typing import Tuple
 
-#i=9900, ref_loss(0,1,..)=[0.431, 0.427, 0.424, 0.425], expected_loss=0.443, entropy_loss=0.003, frame_entropy=0.307
-#... for codebook_size=4, num_codebooks=16, frame_entropy_cutoff=0.300, entropy_scale=0.02
-#i=9900, ref_loss(0,1,..)=[0.437, 0.403, 0.399, 0.399], expected_loss=0.442, entropy_loss=0.005, frame_entropy=0.380
-#... for codebook_size=16, num_codebooks=8, frame_entropy_cutoff=0.375, entropy_scale=0.02
-#i=9900, ref_loss(0,1,..)=[0.432, 0.397, 0.393, 0.392], expected_loss=0.453, entropy_loss=0.018, frame_entropy=1.389
-#... for codebook_size=256, num_codebooks=4, frame_entropy_cutoff=0.469, entropy_scale=0.02
+# i=9900, ref_loss(0,1,..)=[0.431, 0.427, 0.424, 0.425], expected_loss=0.443, entropy_loss=0.003, frame_entropy=0.307
+# ... for codebook_size=4, num_codebooks=16, frame_entropy_cutoff=0.300, entropy_scale=0.02
+# i=9900, ref_loss(0,1,..)=[0.437, 0.403, 0.399, 0.399], expected_loss=0.442, entropy_loss=0.005, frame_entropy=0.380
+# ... for codebook_size=16, num_codebooks=8, frame_entropy_cutoff=0.375, entropy_scale=0.02
+# i=9900, ref_loss(0,1,..)=[0.432, 0.397, 0.393, 0.392], expected_loss=0.453, entropy_loss=0.018, frame_entropy=1.389
+# ... for codebook_size=256, num_codebooks=4, frame_entropy_cutoff=0.469, entropy_scale=0.02
 
 
 class Quantizer(nn.Module):
@@ -72,14 +72,16 @@ class Quantizer(nn.Module):
         return self.to_logits(x) * self.logits_scale
 
 
-    def forward(x: Tensor, as_bytes: bool = False) -> Tensor:
+    def forward(x: Tensor, refine_indexes_iters: int = 2, as_bytes: bool = True) -> Tensor:
         """
         Compute the quantized output, that can be used to reconstruct x.
 
         Args:
                 x: the Tensor to quantize, of shape (*, dim)
+           refine_indexes_iters: a number >= 0: the number of iterations to refine
+                the indexes from their initial value.
         as_bytes:  if True, the quantized output will be returned as a byte
-                 array, combining two codes into a single byte if
+                 array, combining as many codes as possible into each bytes
                  codebook_size <= 16.
 
         Returns:  if as_bytes == False, returns a torch.LongTensor of shape (*, num_codebooks);
@@ -103,11 +105,48 @@ class Quantizer(nn.Module):
                 indices = indices.transpose(0, 1)  # easiest to index 1st dim.
                 indices = (indices[::2] * 16 + indices[1::2]).to(torch.uint8).transpose(0, 1).contiguous()
 
-        shape = list(x.shape)
-        shape[-1] = -1
-        return indices.reshape(*shape)
+        x_reshaped = x.reshape(-1, self.dim)
+        B = x_reshaped.shape[0]
+        logits = self._logits(x_reshaped)
+        logits = logits.reshape(B, self.num_codebooks, self.codebook_size)
 
-    def get_all_permutations(self, n: int, device: torch.device) -> Tensor:
+        # indices: (B, self.num_codebooks)
+        indices = torch.argmax(logits, dim=-1)
+        for _ in range(refine_indexes_iters):
+            indices = self._refine_indexes(x_reshaped, indices)
+        assert indices.ndim == 2
+
+        return indices.reshape(*x.shape[:-1], self.num_codebooks)
+
+    def _compute_indexes(self, x: Tensor, refine_indexes_iters: int = 2) -> Tensor:
+        """
+        Deterministically compute the indexes that encode the tensor x.
+
+        Args:
+                x: the Tensor to quantize, of shape (B, dim)
+          refine_indexes_iters: a number >= 0: the number of iterations to refine
+                the indexes from their initial value.
+
+        Returns:   returns a torch.LongTensor of shape (B, num_codebooks),
+              with entries in {0..codebook_size-1}
+        """
+        assert x.ndim == 2 and x.shape[1] == self.dim
+        B = x.shape[0]
+        x_reshaped = x.reshape(-1, self.dim)
+        B = x_reshaped.shape[0]
+        logits = self._logits(x_reshaped)
+        logits = logits.reshape(B, self.num_codebooks, self.codebook_size)
+
+        # indices: (B, self.num_codebooks)
+        indices = torch.argmax(logits, dim=-1)
+        for _ in range(refine_indexes_iters):
+            indices = self._refine_indexes(x_reshaped, indices)
+        assert indices.ndim == 2
+        return indices.reshape(*x.shape[:-1], self.num_codebooks)
+
+
+
+    def _get_all_permutations(self, n: int, device: torch.device) -> Tensor:
         """
         For a number n, returns a Tensor of float and shape (2**n, n) whose rows are all
         distinct combinations of 0.0 and 1.0.
@@ -118,7 +157,7 @@ class Quantizer(nn.Module):
         ans = ((arange.unsqueeze(1) / powers.unsqueeze(0)).to(torch.int32) % 2 == 0).to(torch.float)
         return ans
 
-    def refine_indexes(self,
+    def _refine_indexes(self,
                        x: Tensor,
                        indexes: Tensor) -> Tensor:
         """
@@ -177,7 +216,7 @@ class Quantizer(nn.Module):
             proposed_deltas = proposed_deltas.transpose(1, 3).reshape(B, self.dim,
                                                                       self.num_codebooks)
             # perm: (2**self.num_codebooks, num_codebooks)
-            perm = self.get_all_permutations(self.num_codebooks, indexes.device)
+            perm = self._get_all_permutations(self.num_codebooks, indexes.device)
 
             # all_possible_deltas: (B, 2**num_codebooks, dim)
             all_possible_deltas = torch.matmul(proposed_deltas, perm.t()).transpose(1,2)
@@ -210,8 +249,8 @@ class Quantizer(nn.Module):
 
         Args:
                 x: the Tensor to quantize, of shape (*, dim)
-               refine_indexes_iters: number of iterations to refine the indexes
-                 from their 1st value.
+           refine_indexes_iters: a number >= 0: the number of iterations to refine
+                the indexes from their initial value.
 
         Returns:   a scalar torch.Tensor containing the relative sum-squared
                     reconstruction loss.
@@ -221,21 +260,16 @@ class Quantizer(nn.Module):
         """
         x_reshaped = x.reshape(-1, self.dim)
         B = x_reshaped.shape[0]
-        logits = self._logits(x_reshaped)
-        logits = logits.reshape(B, self.num_codebooks, self.codebook_size)
 
-        # indices: (B, self.num_codebooks)
-        indices = torch.argmax(logits, dim=-1)
-        for _ in range(refine_indexes_iters):
-            indices = self.refine_indexes(x_reshaped, indices)
-        assert indices.ndim == 2
+        indexes = self._compute_indexes(x_reshaped, refine_indexes_iters)
+        assert indexes.ndim == 2
 
         # indexes_expanded: (num_codebooks, B, dim)
-        indices_expanded = indices.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
+        indexes_expanded = indexes.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
         # to_output_reshaped: (num_codebooks, codebook_size, dim)
         to_output_reshaped = self.to_output.reshape(self.num_codebooks, self.codebook_size, self.dim)
         # chosen_codebooks: (num_codebooks, B, dim).
-        chosen_codebooks = torch.gather(to_output_reshaped, dim=1, index=indices_expanded)
+        chosen_codebooks = torch.gather(to_output_reshaped, dim=1, index=indexes_expanded)
 
         # tot_codebooks: (1, B, dim), this is the sum of the chosen rows of `to_output` corresponding
         # to the chosen codebook entries, this would correspond to the approximated x.
@@ -280,17 +314,17 @@ class Quantizer(nn.Module):
         logits = logits.reshape(-1, self.num_codebooks, self.codebook_size)
         B = logits.shape[0]
         probs = logits.softmax(dim=-1)
-        indices = torch.distributions.categorical.Categorical(probs=probs).sample()
-        # indices is of shape (B, self.num_codebooks) and contains elements in [0..codebook_size - 1]
+        indexes = torch.distributions.categorical.Categorical(probs=probs).sample()
+        # indexes is of shape (B, self.num_codebooks) and contains elements in [0..codebook_size - 1]
 
 
         # to_output_reshaped: (num_codebooks, codebook_size, dim)
         to_output_reshaped = self.to_output.reshape(self.num_codebooks, self.codebook_size, self.dim)
         # indexes_expanded: (num_codebooks, B, dim)
-        indices_expanded = indices.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
+        indexes_expanded = indexes.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
 
         # chosen_codebooks: (num_codebooks, B, dim).
-        chosen_codebooks = torch.gather(to_output_reshaped, dim=1, index=indices_expanded)
+        chosen_codebooks = torch.gather(to_output_reshaped, dim=1, index=indexes_expanded)
 
         # tot_codebooks: (1, B, dim), this is the sum of the chosen rows of `to_output` corresponding
         # to the chosen codebook entries, this would correspond to the approximated x.
