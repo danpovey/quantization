@@ -157,6 +157,29 @@ class Quantizer(nn.Module):
         ans = ((arange.unsqueeze(1) / powers.unsqueeze(0)).to(torch.int32) % 2 == 0).to(torch.float)
         return ans
 
+    def _compute_diff_sumsq(self,
+                            a: Tensor,
+                            b: Tensor) -> Tensor:
+        """
+        This is utility function that computes a particular expression in an optimized
+        way.
+
+        Args:
+           a: a Tensor of shape (i, 1, k, l)
+           b: a Tensor of shape (i, j, 1, l)
+        Returns:
+           a Tensor of shape (i, j, k), that is equal to ((a - b)**2).sum(dim=-1)
+        """
+        assert a.ndim == 4 and a.shape[1] == 1
+        assert b.ndim == 4 and b.shape[2] == 1
+
+        a2 = (a ** 2).sum(dim=-1)   # (i, 1, k)
+        b2 = (b ** 2).sum(dim=-1)   # (i, j, 1)
+        b_permuted = b.permute(0, 2, 3, 1) # (i, 1, l, j)
+        ab = torch.matmul(a, b_permuted)  # (i, 1, k, j)
+        ab = ab.squeeze(1).transpose(1, 2) # (i, j, j)
+        return a2 + b2 - 2 * ab
+
     def _refine_indexes(self,
                        x: Tensor,
                        indexes: Tensor) -> Tensor:
@@ -294,7 +317,9 @@ class Quantizer(nn.Module):
 
     def compute_loss(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
-        Compute three (potential) parts of the loss function.
+        Compute three (potential) parts of the loss function.  This version of the loss function
+        involves an expectation over class probabilities; see also compute_loss_deterministic(),
+        which uses fixed class probabilities, but can't give you a derivative for self.logits.
 
         Args:
                 x: the Tensor to quantize, of shape (*, dim)
@@ -354,20 +379,13 @@ class Quantizer(nn.Module):
         rel_tot_error_sumsq = tot_error_sumsq / x_tot_sumsq
         rel_expected_error_sumsq = expected_error_sumsq / x_tot_sumsq
 
-
-        # following two should be similar, and the same in expectation, which
-        # implies neither is consistently larger or smaller.
-        #if random.random() < 0.01:
-        #    print(f"expected_error_sumsq={rel_expected_error_sumsq}, tot_error_sumsq={rel_tot_error_sumsq}\n")
-
-
         frame_entropy = -((probs * (probs+1.0e-20).log()).sum() / (B * self.num_codebooks))
 
         # avg_probs: (self.num_codebooks, self.codebook_size)
         avg_probs = probs.sum(0) / B
         tot_entropy = -((avg_probs * (avg_probs+1.0e-20).log()).sum() / self.num_codebooks)
-        # entropy_loss > 0, and approaches 0 when tot_entropy approaches log(self.codebook_size),
-        # which is its maximum possible value.
+        # 0 <= entropy_loss <= 1; it approaches 0 when tot_entropy approaches
+        # ref_entropy = log(self.codebook_size), which is its maximum possible value.
         ref_entropy = math.log(self.codebook_size)
         entropy_loss = (ref_entropy - tot_entropy) / ref_entropy
 
