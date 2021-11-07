@@ -72,7 +72,9 @@ class Quantizer(nn.Module):
         return self.to_logits(x) * self.logits_scale
 
 
-    def forward(x: Tensor, refine_indexes_iters: int = 2, as_bytes: bool = True) -> Tensor:
+    def encode(self,
+               x: Tensor, refine_indexes_iters: int = 2,
+               as_bytes: bool = True) -> Tensor:
         """
         Compute the quantized output, that can be used to reconstruct x.
 
@@ -85,38 +87,21 @@ class Quantizer(nn.Module):
                  codebook_size <= 16.
 
         Returns:  if as_bytes == False, returns a torch.LongTensor of shape (*, num_codebooks);
-                  if as_bytes == True, returns a Tensor of dtype=torch.uint8, of
-                  (*, num_codebooks/2) if codebook_size <= 16; else, require
-                  that codebook_size <= 256, and result will be of shape
-                  (*, num_codebooks).
+                  if as_bytes == True, returns a Tensor of dtype=torch.uint8, of shape
+                  (*, num_codebooks/n), where n==4 if codebook_size <= 14; or
+                     2 if codebook_size <= 16, else 1.
         """
-        logits = self._logits(x)
-
-        # reshape logits to (B, self.num_codebooks, self.codebook_size) where B is the
-        # product of all dimensions of x except the last one.
-        tot_codebook_size = self.num_codebooks * self.codebook_size
-        logits = logits.reshape(-1, tot_codebook_size)
-        B = logits.shape[0]
-        indices = torch.distributions.categorical.Categorical(logits=logits).sample()
-        # indices is of shape (B, self.num_codebooks)
+        x_reshaped = x.reshape(-1, self.dim)
+        indexes = self._compute_indexes(x_reshaped, refine_indexes_iters)
 
         if as_bytes:
-            if self.codebook_size <= 16:
-                indices = indices.transpose(0, 1)  # easiest to index 1st dim.
-                indices = (indices[::2] * 16 + indices[1::2]).to(torch.uint8).transpose(0, 1).contiguous()
-
-        x_reshaped = x.reshape(-1, self.dim)
-        B = x_reshaped.shape[0]
-        logits = self._logits(x_reshaped)
-        logits = logits.reshape(B, self.num_codebooks, self.codebook_size)
-
-        # indices: (B, self.num_codebooks)
-        indices = torch.argmax(logits, dim=-1)
-        for _ in range(refine_indexes_iters):
-            indices = self._refine_indexes(x_reshaped, indices)
-        assert indices.ndim == 2
-
-        return indices.reshape(*x.shape[:-1], self.num_codebooks)
+            num_codebooks = self.num_codebooks
+            while num_codebooks ** 2 <= 256:
+                indexes = (indexes[:, ::2] * num_codebooks + indexes[:, 1::2])
+                num_codebooks = num_codebooks ** 2
+            assert num_codebooks <= 256
+            indexes = indexes.to(torch.int8)
+        return indexes.reshape(*x.shape[:-1], -1)
 
     def _compute_indexes(self, x: Tensor, refine_indexes_iters: int = 2) -> Tensor:
         """
@@ -492,7 +477,18 @@ def _test_quantization():
             det_loss = quantizer.compute_loss_deterministic(x, 1)
 
             if i % 100 == 0:
-                det_losses = [ float('%.3f' % quantizer.compute_loss_deterministic(x, i).item()) for i in range(4) ]
+                if i % 200 == 0:
+                    det_losses = [ float('%.3f' % quantizer.compute_loss_deterministic(x, j).item())
+                                   for j in range(4) ]
+                else:
+                    det_losses = []
+                    for j in range(4):
+                        indexes = quantizer.encode(x, j, as_bytes=False)
+                        x_err = quantizer.decode(indexes) - x
+                        rel_err = (x_err**2).sum() / ((x**2).sum() + 1e-20)
+                        rel_err = float('%.3f' % rel_err.item())
+                        det_losses.append(rel_err)
+
                 print(f"i={i}, det_loss(0,1,..)={det_losses}, expected_loss={reconstruction_loss.item():.3f}, "
                       f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
 
