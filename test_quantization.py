@@ -452,6 +452,84 @@ class Quantizer(nn.Module):
         return rel_expected_error_sumsq, entropy_loss, frame_entropy
 
 
+class QuantizerTrainer(object):
+    def __init__(self,
+                 dim: int,
+                 bytes_per_frame: int,
+                 device: torch.device,
+                 phase_one_iters: int = 10000,
+                 lr: float = 0.005):
+        """
+        Args:
+            dim: The feature dimension we are trying to quantize, e.g. 512
+         bytes_per_frame:  The number of bytes to use to quantize each vector of
+                `dim` values.
+           device: The device to use for training
+         phase_one_iters:  The number of iterations to use for the first
+               phase of training (with codebook_size=16); after this we
+               will convert to have codebook_size=256.  These parameters were
+               tuned with a batch size of 600: if your batch size (in frames)
+               is smaller than this you may benefit from a larger phase_one_iters and a
+               smaller learning rate.
+          lr: The initial learning rate.
+        """
+        super(QuantizerTrainer, self).__init__()
+        assert bytes_per_frame in [1,2,4,8,16,32]
+
+        # We'll initially train with codebook_size=16 and
+        # num_codebooks=bytes_per_frame * 2, then after `phase_one_iters` of
+        # training will multiply pairs of codebooks so codebook_size=256 and
+        # num_codebooks=bytes_per_frame
+
+        self.phase_one_iters = phase_one_iters
+        self.cur_iter = 0
+        self.lr = lr
+        self.frame_entropy_cutoff = torch.tensor(0.3, device=device)
+        self.entropy_scale = 0.02
+        self.det_loss_scale = 0.95  # should be in [0..1]
+
+
+        self.quantizer = Quantizer(dim=dim, codebook_size=16,
+                                   num_codebooks=bytes_per_frame*2).to(device)
+        self._init_optimizer()
+
+
+    def _init_optimizer(self):
+        self.optim = torch.optim.Adam(
+            self.quantizer.parameters(), lr=self.lr, betas=(0.9, 0.98), eps=1e-9, weight_decay=1.0e-06
+        )
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim,
+                                                         step_size=self.phase_one_iters/4,
+                                                         gamma=0.5)
+
+
+    def step(self, x: torch.Tensor) -> None:
+        """
+        Does one step of training.  You must call this at least 2*phase_one_iters
+        iterations.
+        Args:
+              x: a Tensor of shape (*, dim) containing the frames of data we are
+                 trying to accurately encode.
+        """
+        x = x.reshape(-1, quantizer.dim)
+
+        if self.cur_iter == self.phase_one_iters:
+            self.begin_second_phase()
+        self.cur_iter += 1
+
+    def _begin_second_phase(self):
+        """
+        This is to be called exactly once, when self.cur_iter reaches self.phase_one_iters
+        """
+        self.quantizer = self.quantizer.get_product_quantizer()
+        self.frame_entropy_cutoff = self.frame_entropy_cutoff * 1.25
+        self.lr *= 0.5
+        self._init_optimizer()
+
+
+    def get_quantizer(self) -> Quantizer:
+        assert self.cur_iter >= 2 * self.phase_one_iters
+        return self.quantizer
 
 
 def _test_quantization():
@@ -563,7 +641,7 @@ def _test_quantization():
         if quantizer.codebook_size >= 256:
             break
         quantizer = quantizer.get_product_quantizer()
-        frame_entropy_cutoff = frame_entropy_cutoff * 1.25
+        #frame_entropy_cutoff = frame_entropy_cutoff * 1.25
         lr *= 0.5
 
 if __name__ == "__main__":
