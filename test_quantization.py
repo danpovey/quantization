@@ -5,13 +5,12 @@ from torch import nn
 from torch import Tensor
 from typing import Tuple
 
-
-# i=9900, ref_loss=0.424, reconstruction_loss=0.436, entropy_loss=0.004, frame_entropy=0.304
-# ... for codebook_size=4, num_codebooks=16, frame_entropy_cutoff=0.30000001192092896, entropy_scale=0.01
-# i=9900, ref_loss=0.414, reconstruction_loss=0.421, entropy_loss=0.012, frame_entropy=0.457
-# ... for codebook_size=16, num_codebooks=8, frame_entropy_cutoff=0.45000001788139343, entropy_scale=0.01
-# i=9900, ref_loss=0.407, reconstruction_loss=0.413, entropy_loss=0.161, frame_entropy=0.698
-# ... for codebook_size=256, num_codebooks=4, frame_entropy_cutoff=0.675000011920929, entropy_scale=0.01
+#i=9900, ref_loss(0,1,..)=[0.431, 0.427, 0.424, 0.425], expected_loss=0.443, entropy_loss=0.003, frame_entropy=0.307
+#... for codebook_size=4, num_codebooks=16, frame_entropy_cutoff=0.300, entropy_scale=0.02
+#i=9900, ref_loss(0,1,..)=[0.437, 0.403, 0.399, 0.399], expected_loss=0.442, entropy_loss=0.005, frame_entropy=0.380
+#... for codebook_size=16, num_codebooks=8, frame_entropy_cutoff=0.375, entropy_scale=0.02
+#i=9900, ref_loss(0,1,..)=[0.432, 0.397, 0.393, 0.392], expected_loss=0.453, entropy_loss=0.018, frame_entropy=1.389
+#... for codebook_size=256, num_codebooks=4, frame_entropy_cutoff=0.469, entropy_scale=0.02
 
 
 class Quantizer(nn.Module):
@@ -371,7 +370,7 @@ def _test_quantization():
     # Train quantizer.
     frame_entropy_cutoff = torch.tensor(0.3, device=device)
     entropy_scale = 0.02
-    ref_loss_scale = 0.9  # should be in [0..1]
+    ref_loss_scale = 0.95  # should be in [0..1]
 
     lr=0.005
     num_iters = 3
@@ -399,12 +398,7 @@ def _test_quantization():
             ref_loss = quantizer.compute_ref_loss(x, 1)
 
             if i % 100 == 0:
-                # only do at most 2 iterations of refining clusters if
-                # num_codebooks <= 8, because in this case we use a more exact
-                # algorithm for which we have never seen an improvement after
-                # the 2st iteration of refinement.
-                n = 3 if quantizer.num_codebooks <= 8 else 4
-                ref_losses = [ float('%.3f' % quantizer.compute_ref_loss(x, i).item()) for i in range(n) ]
+                ref_losses = [ float('%.3f' % quantizer.compute_ref_loss(x, i).item()) for i in range(4) ]
                 print(f"i={i}, ref_loss(0,1,..)={ref_losses}, expected_loss={reconstruction_loss.item():.3f}, "
                       f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
 
