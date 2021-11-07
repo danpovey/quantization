@@ -36,6 +36,10 @@ class MultiKmeansQuantizer(nn.Module):
         self.biases = nn.Parameter(torch.zeros(num_codebooks, codebook_size))
 
 
+        # will be exponentiated to become a scale on a distribution, will be trained
+        # to get a target frame entropy during training.
+        self.frame_entropy_scale = nn.Parameter(torch.zeros(1))
+
 
     def get_product_quantizer(self) -> 'MultiKmeansQuantizer':
         """
@@ -166,7 +170,7 @@ class MultiKmeansQuantizer(nn.Module):
 
         return rel_tot_error_sumsq
 
-    def encode_training(self, x: Tensor, num_iters: int = 4) -> Tuple[Tensor, Tensor]:
+    def encode_training(self, x: Tensor, num_iters: int = 4) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Version of encode() that is to be used during training, that supports an entropy term
         that can be used to balance class probabilities.
@@ -174,7 +178,7 @@ class MultiKmeansQuantizer(nn.Module):
         Args:
               x: a Tensor of shape (*, dim) to be approximated
              num_iters: The number of iterations for optimizing the cluster centers
-        Returns (indexes, entropy_loss), where:
+        Returns (indexes, entropy_loss, frame_entropy), where:
               indexes: a LongTensor of shape (*, num_codebooks) containing elements
                    in {0..codebook_size-1}, that (approximately, modulo self.biases)
                    minimize the sum-squared error reconstruction loss.
@@ -182,33 +186,23 @@ class MultiKmeansQuantizer(nn.Module):
                    the maximum possible average entropy, of log(codebook_size), and the
                    observed class entropy.  Is to be used to encourage classes to have
                    approximately the same probability of being chosen.
+            frame_entropy:  average per-frame entropy of distributions from which we
+                  selected the indexes.
         """
         assert x.shape[-1] == self.dim
         x_reshaped = x.reshape(-1, self.dim)
         B = x_reshaped.shape[0]
 
-        indexes = torch.zeros(B, self.num_codebooks, dtype=torch.long, device=x.device)
+        indexes = torch.randint(self.codebook_size - 1, (B, self.num_codebooks), device=x.device)
 
         for iter in range(num_iters):
-            indexes = self.refine_indexes(x, indexes, training=False)
+            indexes, frame_entropy, entropy_loss = self.refine_indexes_stochastic(x, indexes)
             if False:
                 avg_loss = ((self.decode(indexes) - x) ** 2).sum() / ((x ** 2).sum() + 1e-20)
                 print(f"iter={iter}, avg_loss={avg_loss.item():.3f}")
 
-
-        classes_one_hot = torch.zeros(B, self.num_codebooks, self.codebook_size,
-                                      device=x.device)
-        # indexes: (B, num_codebooks)
-        classes_one_hot.scatter_(dim=2, index=indexes.unsqueeze(-1), value=1.0)
-
-        log_probs = (1.0e-20 + classes_one_hot.sum(dim=0) / B).log()  # (num_codebooks, codebook_size)
-
-        log_probs = log_probs + zeros_with_deriv_like(self.biases)  # (num_codebooks, codebook_size)
-        log_probs = log_probs.log_softmax(dim=1)                   # (num_codebooks, codebook_size)
-        entropy_loss = math.log(self.codebook_size) + (log_probs * log_probs.exp()).sum(dim=1).mean()
-
         indexes = indexes.reshape(*x.shape[:-1], self.num_codebooks)
-        return indexes, entropy_loss
+        return indexes, entropy_loss, frame_entropy
 
 
     def encode(self, x: Tensor, num_iters: int = 4) -> Tensor:
@@ -221,7 +215,18 @@ class MultiKmeansQuantizer(nn.Module):
                    in {0..codebook_size-1}, that can be given to decode(), that should
                    approximately minimize the sum-squared error reconstruction loss.
         """
-        pass
+        assert x.shape[-1] == self.dim
+        x_reshaped = x.reshape(-1, self.dim)
+        B = x_reshaped.shape[0]
+
+        indexes = torch.zeros(B, self.num_codebooks, dtype=torch.long, device=x.device)
+
+        for iter in range(num_iters):
+            indexes = self.refine_indexes(x, indexes, training=False)
+
+        indexes = indexes.reshape(*x.shape[:-1], self.num_codebooks)
+        return indexes
+
 
     def encode_as_bytes(self, x: Tensor) -> Tensor:
         """
@@ -292,12 +297,87 @@ class MultiKmeansQuantizer(nn.Module):
         modified_errs = x_err - cur_centers + all_centers
         modified_neg_sumsq_errs = -((modified_errs ** 2).sum(dim=-1)) # (B, num_codebooks, codebook_size)
 
-        if training:
+        if training and False:
             # self.biases.unsqueeze(0): (1, num_codebooks, codebook_size)
             modified_neg_sumsq_errs += self.biases.unsqueeze(0)
 
         indexes = modified_neg_sumsq_errs.argmax(dim=2) # (B, num_codebooks)
         return indexes
+
+
+    def refine_indexes_stochastic(self,
+                                  x: Tensor,
+                                  indexes: Tensor) -> Tensor:
+        """
+        Refine choices of indexes (this is called iteratively starting from
+        all-zeros).  This version is stochastic.
+        Args:
+           x:  A Tensor of shape (B, self.dim) to be approximated.
+           indexes: A Tensor of integer type, of shape (B, self.num_codebooks),
+                that contains elements in {0..self.codebook_size-1}
+           training: If true, will take into account self.biases, which will
+                in general make the approximation worse but helps control class
+                diversity.
+         Returns:  (new_indexes, frame_entropy, entropy_loss), where:
+                new_indexes: (hopefully) set of indexes of shape (B, self.num_codebooks) that
+                  will hopefully reduce the error w.r.t. x, better or at least no worse
+                  than `indexes`.  This algorithm is not exact, but if the codebooks are
+                  fairly orthogonal it should work fine.   If they are not fairly orthogonal
+                  it may not optimize well, but hopefully the codebooks will then learn
+                  to be more orthogona..
+                entropy_loss: difference between maximum possible entropy over classes
+                  (=log(self.codebook_size)), and the observed average entropy over classes
+                  (averaged over codebooks).  Will be zero if codebooks all have balanced
+                  frequencies.
+                frame_entropy: the average per-frame entropy of the distribution from
+                  which new_indexes was sampled.
+
+        """
+        B = indexes.shape[0]
+        # indexes_expanded has shape (B, self.num_codebooks, 1, self.dim)
+        indexes_expanded = indexes.unsqueeze(-1).unsqueeze(-1).expand(B, self.num_codebooks, 1, self.dim)
+        # centers_expanded has shape (B, self.num_codebooks, self.codebook_size, self.dim)
+        centers_expanded = self.centers.unsqueeze(0).expand(B, self.num_codebooks, self.codebook_size, self.dim)
+
+        # cur_centers: (B, self.num_codebooks, 1, self.dim)
+        cur_centers = torch.gather(centers_expanded, dim=2, index=indexes_expanded)
+        # x_err is of shape (B, 1, 1, self.dim), it is the current error of the approximation vs. x.
+        x_err = cur_centers.sum(dim=1, keepdim=True) - x.unsqueeze(1).unsqueeze(2)
+
+        all_centers = self.centers.unsqueeze(0) # (1, num_codebooks, codebook_size, dim)
+
+        # TODO: get modified_neg_sumsq_errs by a more efficient expression.
+
+        modified_errs = x_err - cur_centers + all_centers
+        modified_neg_sumsq_errs = -((modified_errs ** 2).sum(dim=-1)) # (B, num_codebooks, codebook_size)
+
+        # self.biases.unsqueeze(0): (1, num_codebooks, codebook_size)
+        modified_neg_sumsq_errs += self.biases.unsqueeze(0)
+
+        # 10.0 is just to make it equilibriate faster.
+        # we only want the derivative for frame_entropy to affect frame_entropy_scale.
+        modified_neg_sumsq_errs_detached = modified_neg_sumsq_errs.detach() * (10.0 * self.frame_entropy_scale).exp()
+
+        # codebook_logprobs_detached: (B, num_codebooks, codebook_size)
+        codebook_logprobs_detached = modified_neg_sumsq_errs_detached.log_softmax(dim=-1)
+        # indexes: (B, num_codebooks)
+        indexes = torch.distributions.categorical.Categorical(logits=codebook_logprobs_detached).sample()
+
+
+        codebook_probs_detached = modified_neg_sumsq_errs_detached.softmax(dim=-1)
+        avg_frame_entropy = -(codebook_logprobs_detached * codebook_probs_detached).sum(dim=-1).mean()
+
+
+        modified_neg_sumsq_errs = modified_neg_sumsq_errs * (10.0 * self.frame_entropy_scale).exp()
+        codebook_probs = modified_neg_sumsq_errs.softmax(dim=-1)
+        avg_probs = codebook_probs.mean(dim=0)  # (num_codebooks, codebook_size)
+        class_entropy = -(avg_probs * (avg_probs + 1.0e-20).log()).sum(dim=1).mean()
+
+
+        entropy_loss = math.log(self.codebook_size) - class_entropy
+
+        return indexes, avg_frame_entropy, entropy_loss
+
 
 
 class _ZerosWithDerivLike(torch.autograd.Function):
@@ -340,12 +420,13 @@ def _test_quantization():
     quantizer = MultiKmeansQuantizer(dim=dim, codebook_size=codebook_size,
                                      num_codebooks=num_codebooks).to(device)
 
-    _ = quantizer.get_product_quantizer() # testing..
 
+    target_frame_entropy = 0.3
+
+    entropy_scale = 0.0001
     lr=0.001
     num_iters = 3
     for iter in range(num_iters):
-
 
         # training quantizer, not model.
         optim = torch.optim.Adam(
@@ -353,9 +434,9 @@ def _test_quantization():
         )
 
         # We'll choose in the loop how often to step the scheduler.
-        scheduler = torch.optim.lr_scheduler.StepLR(optim, step_size=500, gamma=0.5)
+        scheduler = torch.optim.lr_scheduler.StepLR(optim, step_size=1000, gamma=0.5)
 
-        for i in range(3000):
+        for i in range(10000):
             B = 600
             x = torch.randn(B, dim, device=device)
             x = model(x)  + 0.05 * x
@@ -364,18 +445,22 @@ def _test_quantization():
             # the output is not limited to a subspace or anything too-easy like that.
 
 
-            indexes, entropy_loss = quantizer.encode_training(x)
+            indexes, entropy_loss, frame_entropy = quantizer.encode_training(x)
 
             rel_err = ((x - quantizer.decode(indexes)) ** 2).sum() / ((x ** 2).sum() + 1.0e-20)
 
             if i % 100 == 0:
-                print(f"i={i}, rel_err={rel_err.item():.3f}, entropy_loss={entropy_loss.item():.3f}")
+                ref_loss = ((x - quantizer.decode(quantizer.encode(x))) ** 2).sum() / ((x ** 2).sum() + 1.0e-20)
+
+                print(f"i={i}, ref_loss={ref_loss.item():.3f}, rel_err={rel_err.item():.3f}, "
+                      f"entropy_loss={entropy_loss.item():.3f}, "
+                      f"frame_entropy={frame_entropy.item():.3f}")
 
             # There is no point including a scale on the entropy term, since it
             # only affects the biases, whose derivs are not affected by anything
             # else, and since we are using Adam the optimization is unaffected by the scale
             # of these derivatives.
-            tot_loss = rel_err + 0.1 * entropy_loss
+            tot_loss = rel_err + entropy_scale * entropy_loss + (frame_entropy - target_frame_entropy).abs()
 
 
             tot_loss.backward()
@@ -387,6 +472,7 @@ def _test_quantization():
 
         if iter + 1 < num_iters:
             quantizer = quantizer.get_product_quantizer()
+            target_frame_entropy *= 1.5
             lr *= 0.5
 
 if __name__ == "__main__":
