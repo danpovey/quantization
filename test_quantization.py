@@ -168,7 +168,7 @@ class Quantizer(nn.Module):
            a: a Tensor of shape (i, 1, k, l)
            b: a Tensor of shape (i, j, 1, l)
         Returns:
-           a Tensor of shape (i, j, k), that is equal to ((a - b)**2).sum(dim=-1)
+           a Tensor of shape (i, j, k), that is equal to ((a + b)**2).sum(dim=-1)
         """
         assert a.ndim == 4 and a.shape[1] == 1
         assert b.ndim == 4 and b.shape[2] == 1
@@ -178,7 +178,7 @@ class Quantizer(nn.Module):
         b_permuted = b.permute(0, 2, 3, 1) # (i, 1, l, j)
         ab = torch.matmul(a, b_permuted)  # (i, 1, k, j)
         ab = ab.squeeze(1).transpose(1, 2) # (i, j, j)
-        return a2 + b2 - 2 * ab
+        return a2 + b2 + 2 * ab
 
     def _refine_indexes(self,
                        x: Tensor,
@@ -367,12 +367,13 @@ class Quantizer(nn.Module):
         # alt_error: (num_codebooks, 1, B, dim) + (num_codebooks, codebook_size, 1, dim) = (num_codebooks, codebook_size, B, dim)
         # alt_error answers the question: "what if, for this particular codebook, we had chosen this
         # codebook entry; what would the error be then?"
-        alt_error = (tot_error - chosen_codebooks).unsqueeze(1) + to_output_reshaped.unsqueeze(2)
+        alt_error_sumsq = self._compute_diff_sumsq((tot_error - chosen_codebooks).unsqueeze(1),
+                                                   to_output_reshaped.unsqueeze(2))
 
         # expected_error_sumsq is like tot_error_sumsq, but replaces the
         # discrete choice with an expectation of the sum-sq error, taken over each codebook
         # while leaving the choices of all the other codebooks fixed.
-        expected_error_sumsq = ((alt_error ** 2).sum(dim=-1) * probs.permute(1, 2, 0)).sum() - (tot_error_sumsq * (self.num_codebooks - 1))
+        expected_error_sumsq = (alt_error_sumsq * probs.permute(1, 2, 0)).sum() - (tot_error_sumsq * (self.num_codebooks - 1))
 
         x_tot_sumsq = (x ** 2).sum() + 1.0e-20
 
