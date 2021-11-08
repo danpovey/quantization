@@ -563,7 +563,7 @@ class QuantizerTrainer(object):
             # before using this code.
             logging.info(f"phase={phase}/2, iter={i}, "
                          f"dim,nc,csz={self.quantizer.dim},{self.quantizer.num_codebooks},{self.quantizer.codebook_size}, "
-                         f"loss_per_iter(0,1,..)={det_losses}, "
+                         f"loss_per_iter={det_losses}, "
                          f"soft_loss={reconstruction_loss.item():.3f}, "
                          f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
 
