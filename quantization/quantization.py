@@ -1,16 +1,11 @@
 import math
 import torch
 import random
+import logging
 from torch import nn
 from torch import Tensor
 from typing import Tuple
 
-# i=9900, ref_loss(0,1,..)=[0.431, 0.427, 0.424, 0.425], expected_loss=0.443, entropy_loss=0.003, frame_entropy=0.307
-# ... for codebook_size=4, num_codebooks=16, frame_entropy_cutoff=0.300, entropy_scale=0.02
-# i=9900, ref_loss(0,1,..)=[0.437, 0.403, 0.399, 0.399], expected_loss=0.442, entropy_loss=0.005, frame_entropy=0.380
-# ... for codebook_size=16, num_codebooks=8, frame_entropy_cutoff=0.375, entropy_scale=0.02
-# i=9900, ref_loss(0,1,..)=[0.432, 0.397, 0.393, 0.392], expected_loss=0.453, entropy_loss=0.018, frame_entropy=1.389
-# ... for codebook_size=256, num_codebooks=4, frame_entropy_cutoff=0.469, entropy_scale=0.02
 
 
 class Quantizer(nn.Module):
@@ -86,7 +81,7 @@ class Quantizer(nn.Module):
                  array, combining as many codes as possible into each bytes
                  codebook_size <= 16.
 
-        Returns:  if as_bytes == Falsea torch.LongTensor of shape (*, num_codebooks);
+        Returns:  if as_bytes == False, a torch.LongTensor of shape (*, num_codebooks);
                   if as_bytes == True, a returns a Tensor of dtype=torch.uint8, of shape
                   (*, num_codebooks/n), where n==4 if codebook_size <= 14; or
                      2 if codebook_size <= 16, else 1.
@@ -327,7 +322,7 @@ class Quantizer(nn.Module):
         """
         orig_shape = indexes.shape
         indexes = indexes.reshape(-1, indexes.shape[-1])
-        indexes = self._maybe_separate_indexes(indexes)
+        indexes = self._maybe_separate_indexes(indexes).to(dtype=torch.int64)
 
         assert indexes.ndim == 2
         B = indexes.shape[0]
@@ -536,9 +531,14 @@ class QuantizerTrainer(object):
                            for j in range(4) ]
             phase = 1 if self.cur_iter <= self.phase_one_iters else 2
             i = self.cur_iter - self.phase_one_iters if phase > 1 else self.cur_iter
-            print(f"phase={phase}/2, iter={i}, det_loss(0,1,..)={det_losses}, "
-                  f"expected_loss={reconstruction_loss.item():.3f}, "
-                  f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
+            # Caution: python's logging level is logging.ERROR by default.  To make the following
+            # be printed, you may have to do:
+            #  import logging
+            #  logging.getLogger().setLevel(logging.INFO)
+            # before using this code.
+            logging.info(f"phase={phase}/2, iter={i}, det_loss(0,1,..)={det_losses}, "
+                        f"expected_loss={reconstruction_loss.item():.3f}, "
+                        f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
 
         # reconstruction_loss >= 0, equals 0 when reconstruction is exact.
         tot_loss = (reconstruction_loss * (1 - self.det_loss_scale) +
@@ -569,177 +569,3 @@ class QuantizerTrainer(object):
     def get_quantizer(self) -> Quantizer:
         assert self.cur_iter >= 2 * self.phase_one_iters
         return self.quantizer
-
-
-def _test_quantizer_trainer():
-    print("Testing dim=256")
-    torch.manual_seed(1)
-    dim = 256
-    device = torch.device('cuda')
-    model = nn.Sequential(
-        nn.Linear(dim, dim),
-        nn.ReLU(),
-        nn.Linear(dim, dim),
-        nn.ReLU(),
-        nn.LayerNorm(dim),
-        nn.Linear(dim, dim),
-    ).to(device)
-    trainer = QuantizerTrainer(dim=256, bytes_per_frame=4,
-                               phase_one_iters=10000,
-                               device=torch.device('cuda'))
-
-    B = 600
-    while not trainer.done():
-        x = torch.randn(B, dim, device=device)
-        x = model(x)  + 0.05 * x
-        trainer.step(x)
-    print("Done testing dim=256")
-
-def _test_quantizer_trainer_double():
-    # doubled means, 2 copies of the same distribution; we do this
-    # so we can compare the loss function with the loss in
-    # _test_quantizer_trainer()
-    # (if we just created a network with larger dim, we would be
-    # changing the problem and wouldn't know how to compare)
-    print("Testing dim=512, doubled...")
-    torch.manual_seed(1)
-    dim = 256
-    device = torch.device('cuda')
-    model = nn.Sequential(
-        nn.Linear(dim, dim),
-        nn.ReLU(),
-        nn.Linear(dim, dim),
-        nn.ReLU(),
-        nn.LayerNorm(dim),
-        nn.Linear(dim, dim),
-    ).to(device)
-    trainer = QuantizerTrainer(dim=512, bytes_per_frame=8,
-                               device=torch.device('cuda'),
-                               phase_one_iters=20000)
-    B = 600
-    while not trainer.done():
-        x1 = torch.randn(B, dim, device=device)
-        x2 = torch.randn(B, dim, device=device)
-        x1 = model(x1)  + 0.05 * x1
-        x2 = model(x2)  + 0.05 * x2
-        x = torch.cat((x1, x2), dim=1)
-        trainer.step(x)
-    print("Done testing dim=512, doubled...")
-
-
-def _test_quantization():
-    torch.manual_seed(1)
-    dim = 256
-    device = torch.device('cuda')
-    model = nn.Sequential(
-        nn.Linear(dim, dim),
-        nn.ReLU(),
-        nn.Linear(dim, dim),
-        nn.ReLU(),
-        nn.LayerNorm(dim),
-        nn.Linear(dim, dim),
-    ).to(device)
-
-
-    # for easier conversion into bytes, we recommend that codebook_size should
-    # oalways be of the form 2**(2**n), i.e. 2, 4, 16, 256.
-    # num_codebooks should always be a power of 2.
-    #
-    # SET SIZES:
-    # We start with codebook_size, num_codebooks = (4, 16), but after training
-    # the model we expand it to (16, 8), the train more, then expand to
-    # (256, 4), then train more.
-    codebook_size = 16
-    num_codebooks = 8
-
-    quantizer = Quantizer(dim=dim, codebook_size=codebook_size,
-                          num_codebooks=num_codebooks).to(device)
-
-
-    # Train quantizer.
-    frame_entropy_cutoff = torch.tensor(0.3, device=device)
-    entropy_scale = 0.02
-    det_loss_scale = 0.95  # should be in [0..1]
-
-    lr=0.005
-    while True:
-        # we'll break from this loop when quantizer.codebook_size >= 256.
-
-        # training quantizer, not model.
-        optim = torch.optim.Adam(
-            quantizer.parameters(), lr=lr, betas=(0.9, 0.98), eps=1e-9, weight_decay=0.000001
-        )
-
-        scheduler = torch.optim.lr_scheduler.StepLR(optim, step_size=2500, gamma=0.5)
-
-        for i in range(10000):
-            B = 600
-            x = torch.randn(B, dim, device=device)
-            x = model(x)  + 0.05 * x
-            # x is the thing we're trying to quantize: the nnet gives it a non-trivial distribution, which is supposed to
-            # emulate a typical output of a neural net.  The "+ 0.05 * x" is a kind of residual term which makes sure
-            # the output is not limited to a subspace or anything too-easy like that.  Lots of networks
-            # have residuals, so this is quite realistic.
-
-
-            reconstruction_loss, entropy_loss, frame_entropy = quantizer.compute_loss(x)
-
-            det_loss = quantizer.compute_loss_deterministic(x, 1)
-
-            if i % 100 == 0:
-                if i % 200 == 0:
-                    det_losses = [ float('%.3f' % quantizer.compute_loss_deterministic(x, j).item())
-                                   for j in range(4) ]
-                else:
-                    det_losses = []
-                    for j in range(4):
-                        indexes = quantizer.encode(x, j, as_bytes=False)
-                        if random.random()  < 0.1:
-                            # Test the as_bytes option.
-                            indexes2 = quantizer.encode(x, j, as_bytes=True)
-                            assert indexes2.dtype == torch.uint8
-                            indexes_ref = quantizer._maybe_separate_indexes(indexes2)
-                            assert torch.all(indexes_ref == indexes)
-
-                        x_err = quantizer.decode(indexes) - x
-                        rel_err = (x_err**2).sum() / ((x**2).sum() + 1e-20)
-                        rel_err = float('%.3f' % rel_err.item())
-                        det_losses.append(rel_err)
-
-                print(f"i={i}, det_loss(0,1,..)={det_losses}, expected_loss={reconstruction_loss.item():.3f}, "
-                      f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
-
-
-            # reconstruction_loss >= 0, equals 0 when reconstruction is exact.
-            tot_loss = reconstruction_loss * (1 - det_loss_scale)
-
-            tot_loss += det_loss * det_loss_scale
-
-            # entropy_loss approaches 0 from above, as the entropy of classes
-            # approaches its maximum possible.  (this relates to diversity of
-            # chosen codebook entries in classes).
-            tot_loss += entropy_loss * entropy_scale
-
-            # We want to maximize frame_entropy if it is less than frame_entropy_cutoff.
-            tot_loss -= torch.minimum(frame_entropy_cutoff,
-                                      frame_entropy)
-
-            tot_loss.backward()
-            optim.step()
-            optim.zero_grad()
-            scheduler.step()
-
-        print(f"... for codebook_size={quantizer.codebook_size}, num_codebooks={quantizer.num_codebooks}, "
-              f"frame_entropy_cutoff={frame_entropy_cutoff.item():.3f}, entropy_scale={entropy_scale}, "
-              f"det_loss_scale={det_loss_scale}")
-
-        if quantizer.codebook_size >= 256:
-            break
-        quantizer = quantizer.get_product_quantizer()
-        #frame_entropy_cutoff = frame_entropy_cutoff * 1.25
-        lr *= 0.5
-
-if __name__ == "__main__":
-    _test_quantizer_trainer()
-    _test_quantizer_trainer_double()
-    _test_quantization()
