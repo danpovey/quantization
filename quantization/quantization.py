@@ -596,3 +596,62 @@ class QuantizerTrainer(object):
     def get_quantizer(self) -> Quantizer:
         assert self.cur_iter >= 2 * self.phase_one_iters
         return self.quantizer
+
+
+
+def read_training_data(filename: str) -> torch.Tensor:
+    """
+    Reads the hdf5 archive in the file with name 'filename' into a single
+    numpy array of size (tot_frames, dim), shuffles the frames, and returns it
+    as a numpy array.  The type will be the same as it was in the archive (e.g. float16).
+
+    Args:
+        filename: the name of the filename of your hdf5 archive.  It should
+        have been created using code similar to the code in test_write_hdf5.py,
+        e.g. something like:
+
+          hf = h5py.File(filename, 'w')
+          for i in range(...):
+            # get x as some numpy array of type np.float16, and shape (*, dim)
+            # the name does not actually matter, except that they should be distinct.
+            hf.create_dataset(f'dataset_{i}', data=x)
+     Returns:
+        a torch.Tensor of shape (tot_num_frames, dim), on CPU, with dtype=torch.float16,
+        with shuffled rows.
+
+    """
+    print("Opening file ", filename)
+    hf = h5py.File(filename, 'r')
+    tot_frames = 0
+    dim = -1
+
+    def get_num_frames(shape):
+        # Returns product of shape[0],shape[1],...,shape[-2]
+        num_frames = 1
+        for i in shape[:-1]:
+            num_frames *= i
+        return num_frames
+
+    for key in hf.keys():
+        dset = hf[key]
+        shape = list(dset.shape)
+        if dim == -1:
+            dim = shape[-1]
+        else:
+            assert dim == shape[-1], "Dataset must have consistent dimension (last element of shape"
+        tot_frames += get_num_frames(shape)
+    print("tot_frames = ", tot_frames)
+
+    ans = np.empty((tot_frames, dim), dtype=np.float16)
+    cur_pos = 0
+    for key in hf.keys():
+        array = hf[key][:] # [:] gets it as NumPy array (I believe).
+        array = np.ascontiguousarray(array).reshape(-1, dim)
+        num_frames = array.shape[0]
+        ans[cur_pos:cur_pos+num_frames,:] = array
+        cur_pos += num_frames
+    assert cur_pos == tot_frames
+
+    # Shuffle the rows of ans.
+    np.random.shuffle(ans)
+    return torch.from_numpy(ans)
