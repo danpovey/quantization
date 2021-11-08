@@ -73,7 +73,7 @@ class Quantizer(nn.Module):
 
 
     def encode(self,
-               x: Tensor, refine_indexes_iters: int = 2,
+               x: Tensor, refine_indexes_iters: int = 3,
                as_bytes: bool = True) -> Tensor:
         """
         Compute the quantized output, that can be used to reconstruct x.
@@ -457,7 +457,7 @@ class QuantizerTrainer(object):
                  dim: int,
                  bytes_per_frame: int,
                  device: torch.device,
-                 phase_one_iters: int = 10000,
+                 phase_one_iters: int = 20000,
                  lr: float = 0.005):
         """
         Args:
@@ -471,6 +471,9 @@ class QuantizerTrainer(object):
                tuned with a batch size of 600: if your batch size (in frames)
                is smaller than this you may benefit from a larger phase_one_iters and a
                smaller learning rate.
+               [Also, note: phase_one_iters should be larger for larger dims;
+               for dim=256 and batch_size=600, 10k was enough, but for
+               dim=512 and batch_size=600, 20k was better.
           lr: The initial learning rate.
 
         This object trains a Quantizer.  You can use it as follows:
@@ -569,6 +572,7 @@ class QuantizerTrainer(object):
 
 
 def _test_quantizer_trainer():
+    print("Testing dim=256")
     torch.manual_seed(1)
     dim = 256
     device = torch.device('cuda')
@@ -580,14 +584,47 @@ def _test_quantizer_trainer():
         nn.LayerNorm(dim),
         nn.Linear(dim, dim),
     ).to(device)
-    trainer = QuantizerTrainer(dim=dim, bytes_per_frame=4,
+    trainer = QuantizerTrainer(dim=256, bytes_per_frame=4,
+                               phase_one_iters=10000,
                                device=torch.device('cuda'))
+
     B = 600
     while not trainer.done():
         x = torch.randn(B, dim, device=device)
         x = model(x)  + 0.05 * x
         trainer.step(x)
-    # TODO..
+    print("Done testing dim=256")
+
+def _test_quantizer_trainer_double():
+    # doubled means, 2 copies of the same distribution; we do this
+    # so we can compare the loss function with the loss in
+    # _test_quantizer_trainer()
+    # (if we just created a network with larger dim, we would be
+    # changing the problem and wouldn't know how to compare)
+    print("Testing dim=512, doubled...")
+    torch.manual_seed(1)
+    dim = 256
+    device = torch.device('cuda')
+    model = nn.Sequential(
+        nn.Linear(dim, dim),
+        nn.ReLU(),
+        nn.Linear(dim, dim),
+        nn.ReLU(),
+        nn.LayerNorm(dim),
+        nn.Linear(dim, dim),
+    ).to(device)
+    trainer = QuantizerTrainer(dim=512, bytes_per_frame=8,
+                               device=torch.device('cuda'),
+                               phase_one_iters=20000)
+    B = 600
+    while not trainer.done():
+        x1 = torch.randn(B, dim, device=device)
+        x2 = torch.randn(B, dim, device=device)
+        x1 = model(x1)  + 0.05 * x1
+        x2 = model(x2)  + 0.05 * x2
+        x = torch.cat((x1, x2), dim=1)
+        trainer.step(x)
+    print("Done testing dim=512, doubled...")
 
 
 def _test_quantization():
@@ -704,4 +741,5 @@ def _test_quantization():
 
 if __name__ == "__main__":
     _test_quantizer_trainer()
+    _test_quantizer_trainer_double()
     _test_quantization()
