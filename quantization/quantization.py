@@ -551,7 +551,7 @@ class QuantizerTrainer(object):
 
         det_loss = self.quantizer.compute_loss_deterministic(x, 1)
 
-        if self.cur_iter % 100 == 0:
+        if self.cur_iter % 200 == 0:
             det_losses = [ float('%.3f' % self.quantizer.compute_loss_deterministic(x, j).item())
                            for j in range(4) ]
             phase = 1 if self.cur_iter <= self.phase_one_iters else 2
@@ -561,9 +561,11 @@ class QuantizerTrainer(object):
             #  import logging
             #  logging.getLogger().setLevel(logging.INFO)
             # before using this code.
-            logging.info(f"phase={phase}/2, iter={i}, det_loss(0,1,..)={det_losses}, "
-                        f"expected_loss={reconstruction_loss.item():.3f}, "
-                        f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
+            logging.info(f"phase={phase}/2, iter={i}, "
+                         f"dim,nc,csz={self.quantizer.dim},{self.quantizer.num_codebooks},{self.quantizer.codebook_size}, "
+                         f"loss_per_iter(0,1,..)={det_losses}, "
+                         f"soft_loss={reconstruction_loss.item():.3f}, "
+                         f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
 
         # reconstruction_loss >= 0, equals 0 when reconstruction is exact.
         tot_loss = (reconstruction_loss * (1 - self.det_loss_scale) +
