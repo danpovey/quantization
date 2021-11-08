@@ -127,7 +127,6 @@ class Quantizer(nn.Module):
         return indexes.reshape(*x.shape[:-1], self.num_codebooks)
 
 
-
     def _get_all_permutations(self, n: int, device: torch.device) -> Tensor:
         """
         For a number n, returns a Tensor of float and shape (2**n, n) whose rows are all
@@ -231,50 +230,76 @@ class Quantizer(nn.Module):
         # modified_errs = x_err - cur_centers + all_centers
         # modified_neg_sumsq_errs = -((modified_errs ** 2).sum(dim=-1))
 
-        if self.num_codebooks <= 8:
-            # put -infinity in modified_neg_sumsq_errs in locations corresponding to the current "index",
-            # to disallow them (we'll consider those later, separately).
-            src = torch.full((B, self.num_codebooks, self.codebook_size), float('-inf'), device=indexes.device)
-            modified_neg_sumsq_errs.scatter_(dim=2, index=indexes.unsqueeze(-1), src=src)
+        # put -infinity in modified_neg_sumsq_errs in locations corresponding to the current "index",
+        # to disallow them when searching for the best alternative to the current index.
+        src = torch.full((B, self.num_codebooks, self.codebook_size), float('-inf'),
+                         device=indexes.device)
+        modified_neg_sumsq_errs.scatter_(dim=2, index=indexes.unsqueeze(-1), src=src)
 
-            # proposed_indexes contains the best alternative to the index in 'indexes'
-            proposed_indexes = modified_neg_sumsq_errs.argmax(dim=2) # (B, num_codebooks)
+        # proposed_indexes contains the best alternative to the index in 'indexes'
+        proposed_indexes = modified_neg_sumsq_errs.argmax(dim=2) # (B, num_codebooks)
 
-            # proposed_indexes_expanded: (B, self.num_codebooks, 1, self.dim)
-            proposed_indexes_expanded = proposed_indexes.unsqueeze(-1).unsqueeze(-1).expand(B, self.num_codebooks, 1, self.dim)
 
-            # proposed_new_centers: (B, self.num_codebooks, 1, self.dim), the same
-            # shape as cur_centers but containing the centers corresponding to 'proposed_indexes'
-            proposed_new_centers = torch.gather(centers_expanded, dim=2, index=proposed_indexes_expanded)
-            # proposed_deltas, of shape (B, num_codebooks, 1, dim), contains the
-            # change in the prediction if we were to accept the best alternative index for
-            # each codebook.
-            proposed_deltas = proposed_new_centers - cur_centers
-            # proposed_deltas: (B, dim, num_codebooks)
-            proposed_deltas = proposed_deltas.transpose(1, 3).reshape(B, self.dim,
-                                                                      self.num_codebooks)
-            # perm: (2**self.num_codebooks, num_codebooks)
-            perm = self._get_all_permutations(self.num_codebooks, indexes.device)
+        # proposed_indexes_expanded: (B, self.num_codebooks, 1, self.dim)
+        proposed_indexes_expanded = (
+            proposed_indexes.unsqueeze(-1).unsqueeze(-1).expand(B, self.num_codebooks, 1, self.dim))
 
-            # all_possible_deltas: (B, 2**num_codebooks, dim)
-            all_possible_deltas = torch.matmul(proposed_deltas, perm.t()).transpose(1,2)
-            assert all_possible_deltas.shape == (B, 2**self.num_codebooks, self.dim)
-            x_err_squeezed = x_err.squeeze(1) # (B, 1, dim)
-            all_possible_x_errs = x_err_squeezed + all_possible_deltas  # (B, 2**num_codebooks, dim)
-            all_possible_x_errs_sumsq = (all_possible_x_errs**2).sum(dim=-1) # (B, 2**num_codebooks)
+        # proposed_new_centers: (B, self.num_codebooks, 1, self.dim), the same
+        # shape as cur_centers but containing the centers corresponding to 'proposed_indexes'
+        proposed_new_centers = torch.gather(centers_expanded, dim=2, index=proposed_indexes_expanded)
+
+        # proposed_deltas, of shape (B, num_codebooks, 1, dim), contains the
+        # change in the prediction if we were to accept the best alternative index for
+        # each codebook.
+        proposed_deltas = proposed_new_centers - cur_centers
+        # proposed_deltas: (B, dim, num_codebooks)
+        proposed_deltas = proposed_deltas.transpose(1, 3).reshape(B, self.dim,
+                                                                  self.num_codebooks)
+        x_err_squeezed = x_err.squeeze(1) # (B, 1, dim)
+
+        N = 8  # because 2**8==256 is OK to enumerate; 2**16 is not.
+
+        for begin_c in range(0, self.num_codebooks, N):
+            end_c = min(self.num_codebooks, begin_c + N)
+            this_num_c = end_c - begin_c
+
+            # perm: (2**this_num_c, this_num_c)
+            perm = self._get_all_permutations(this_num_c,
+                                              indexes.device)
+
+            this_proposed_deltas = proposed_deltas[:,:,begin_c:end_c]
+
+            # all_possible_deltas: (B, 2**this_num_c, dim)
+            all_possible_deltas = torch.matmul(this_proposed_deltas,
+                                               perm.t()).transpose(1,2)
+
+            assert all_possible_deltas.shape == (B, 2**this_num_c, self.dim)
+            all_possible_x_errs = x_err_squeezed + all_possible_deltas  # (B, 2**this_num_c, dim)
+            all_possible_x_errs_sumsq = (all_possible_x_errs**2).sum(dim=-1) # (B, 2**this_num_c)
             perm_rows = (-all_possible_x_errs_sumsq).argmax(dim=1) # (B,)
             assert perm_rows.shape == (B,)
 
-            # selected_perm_rows will be of shape (B, num_codebooks), with a 1
+            # selected_perm_rows will be of shape (B, this_num_c), with a 1
             # in each position where we want to select the proposed change.
             selected_perm_rows = torch.index_select(input=perm.to(torch.int32),
                                                     dim=0,
                                                     index=perm_rows)
-            assert selected_perm_rows.shape == (B, self.num_codebooks)
+            assert selected_perm_rows.shape == (B, this_num_c)
 
-            indexes = (proposed_indexes * selected_perm_rows) + (indexes * (1 - selected_perm_rows))
-        else:
-            indexes = modified_neg_sumsq_errs.argmax(dim=2) # (B, num_codebooks)
+            # Replace selected elements of `indexes` with elements of `proposed_indexes`
+            indexes[:,begin_c:end_c] = ((proposed_indexes[:,begin_c:end_c] * selected_perm_rows) +
+                                        (indexes[:,begin_c:end_c] * (1 - selected_perm_rows)))
+
+            if begin_c + N < self.num_codebooks:
+                # not the last iter.. must keep x_err_squeezed updated.
+                # perm_rows_reshaped: (B, 1, dim), contains elements in {0..2**this_num_c-1}
+                perm_rows_reshaped = perm_rows.unsqueeze(1).unsqueeze(2).expand(B, 1, self.dim)
+                # selected_deltas contains the changes in x_approx that we selected.
+                # Its shape is (B, 1, dim).
+                selected_deltas = torch.gather(all_possible_deltas, dim=1,
+                                               index=perm_rows_reshaped)
+                x_err_squeezed += selected_deltas
+
 
         assert indexes.ndim == 2
         return indexes
