@@ -119,12 +119,12 @@ class Quantizer(nn.Module):
         logits = self._logits(x_reshaped)
         logits = logits.reshape(B, self.num_codebooks, self.codebook_size)
 
-        # indices: (B, self.num_codebooks)
-        indices = torch.argmax(logits, dim=-1)
+        # indexes: (B, self.num_codebooks)
+        indexes = torch.argmax(logits, dim=-1)
         for _ in range(refine_indexes_iters):
-            indices = self._refine_indexes(x_reshaped, indices)
-        assert indices.ndim == 2
-        return indices.reshape(*x.shape[:-1], self.num_codebooks)
+            indexes = self._refine_indexes(x_reshaped, indexes)
+        assert indexes.ndim == 2
+        return indexes.reshape(*x.shape[:-1], self.num_codebooks)
 
 
 
