@@ -43,7 +43,7 @@ def _test_quantizer_trainer():
         x_approx = quantizer.decode(quantizer.encode(x))
         avg_rel_err += (1/k) * ((x-x_approx)**2).sum() / (x**2).sum()
 
-    print("Done testing dim=256, avg relative approximation error = ", avg_rel_err)
+    print("Done testing dim=256, avg relative approximation error = ", avg_rel_err.item())
 
 def _test_quantizer_trainer_double():
     # doubled means, 2 copies of the same distribution; we do this
