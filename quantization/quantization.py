@@ -1,4 +1,6 @@
+import h5py
 import math
+import numpy as np
 import torch
 import random
 import logging
@@ -31,6 +33,10 @@ class Quantizer(nn.Module):
         # (num_codebooks, codebook_size, dim); and similarly with self.to_logits
         self.centers = nn.Parameter(self.to_logits.weight.detach().clone())
 
+
+
+    def show_init_invocation(self) -> str:
+        return f"quantization.Quantizer(dim={self.dim}, codebook_size={self.codebook_size}, num_codebooks={self.num_codebooks})"
 
 
     def get_product_quantizer(self) -> 'Quantizer':
@@ -599,7 +605,7 @@ class QuantizerTrainer(object):
 
 
 
-def read_training_data(filename: str) -> torch.Tensor:
+def read_hdf5_data(filename: str) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Reads the hdf5 archive in the file with name 'filename' into a single
     numpy array of size (tot_frames, dim), shuffles the frames, and returns it
@@ -615,12 +621,21 @@ def read_training_data(filename: str) -> torch.Tensor:
             # get x as some numpy array of type np.float16, and shape (*, dim)
             # the name does not actually matter, except that they should be distinct.
             hf.create_dataset(f'dataset_{i}', data=x)
-     Returns:
-        a torch.Tensor of shape (tot_num_frames, dim), on CPU, with dtype=torch.float16,
-        with shuffled rows.
+
+     Returns (train, valid), where:
+          train: a torch.Tensor of shape (tot_train_frames, dim), on CPU, with
+                  dtype=torch.float16, with shuffled rows.
+          valid: a torch.Tensor of shape (tot_valid_frames, dim), on CPU, with
+                  dtype=torch.float16, with shuffled rows (these are distinct
+                  frames from those in `train`, but may derive from diffrent
+                  rows of the same original tensors.)
+
+    Caution: you should set the logger to INFO level, with:
+      logging.getLogger().setLevel(logging.INFO)
+    if you want to see the logging output of this function.
 
     """
-    print("Opening file ", filename)
+    logging.info(f"Opening file {filename}")
     hf = h5py.File(filename, 'r')
     tot_frames = 0
     dim = -1
@@ -640,7 +655,7 @@ def read_training_data(filename: str) -> torch.Tensor:
         else:
             assert dim == shape[-1], "Dataset must have consistent dimension (last element of shape"
         tot_frames += get_num_frames(shape)
-    print("tot_frames = ", tot_frames)
+    logging.info(f"read_data: tot_frames = {tot_frames}")
 
     ans = np.empty((tot_frames, dim), dtype=np.float16)
     cur_pos = 0
@@ -654,4 +669,14 @@ def read_training_data(filename: str) -> torch.Tensor:
 
     # Shuffle the rows of ans.
     np.random.shuffle(ans)
-    return torch.from_numpy(ans)
+    ans_torch = torch.from_numpy(ans)
+
+    valid_proportion = 0.05
+    valid_frames = valid_proportion * tot_frames
+    if valid_frames > 10000:
+        valid_frames = 10000
+    train_frames = tot_frames - valid_frames
+    logging.info(f"read_data: train_frames={train_frames}, valid_frames={valid_frames}")
+
+    # return (train, valid)
+    return ans_torch[valid_frames:tot_frames], ans_torch[:valid_frames]

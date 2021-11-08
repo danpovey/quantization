@@ -18,7 +18,7 @@ def _write_example_data():
     ).to(device)
     model.eval()
 
-    num_tensors = 1000
+    num_tensors = 2000
     filename = 'training_data.hdf5'
     hf = h5py.File(filename, 'w')
 
