@@ -18,7 +18,7 @@ def _write_example_data():
     ).to(device)
     model.eval()
 
-    num_frames = 5000000 # 5 million frames
+    num_frames = 1000000 # 1 million frames
     B = 1024 # batch size
     num_tensors = num_frames // B
     filename = 'training_data.hdf5'

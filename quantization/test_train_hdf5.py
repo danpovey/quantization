@@ -26,7 +26,7 @@ def _test_train_from_file():
             yield data[start:end,:].to(device).to(dtype=torch.float)
 
     trainer = QuantizerTrainer(dim=dim, bytes_per_frame=4,
-                               phase_one_iters=10000,
+                               phase_one_iters=20000,
                                device=device)
 
     for x in minibatch_generator(train, repeat=True):

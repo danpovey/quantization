@@ -382,11 +382,19 @@ class Quantizer(nn.Module):
            refine_indexes_iters: a number >= 0: the number of iterations to refine
                 the indexes from their initial value.
 
-        Returns:   a scalar torch.Tensor containing the relative sum-squared
+        Returns: (rel_reconstruction_loss, logprob_loss, entropy_loss, index_entropy_loss), where
+             rel_reconstruction_loss:  a scalar torch.Tensor containing the relative sum-squared
                     reconstruction loss.
                     It is the sum-squared of (x - reconstructed_x) / sum-squared of x, which will
                     for already-trained models be between 0 and 1, but could be greater than 1
                     at the start of training.
+             logprob_loss: the negative average logprob of the selected classes (i.e. those
+                   selected after refine_indexes_iters of refinement).
+             logits_entropy_loss: the class entropy loss, from the logits which approaches zero when all classes
+                   of all codebooks are equi-probable (in the logits output).
+             index_entropy_loss: the class entropy loss, from the computed indexes,  which approaches zero when all classes
+                   of all codebooks are equi-probable (in the indexes output).  Not differentiable but useful
+                   for diagnostics.
         """
         x = x.reshape(-1, self.dim)
         indexes = self._compute_indexes(x, refine_indexes_iters)
@@ -394,96 +402,54 @@ class Quantizer(nn.Module):
         # tot_error: (B, dim), the error of the approximated vs. real x.
         tot_error = x_approx - x
         rel_reconstruction_loss = (tot_error**2).sum() / ((x ** 2).sum() + 1.0e-20)
-        return rel_reconstruction_loss
 
-    def compute_loss(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        """
-        Compute three (potential) parts of the loss function.  This version of the loss function
-        involves an expectation over class probabilities; see also compute_loss_deterministic(),
-        which uses fixed class probabilities, but can't give you a derivative for self.logits.
+        # Get logprob loss and class-entropy loss
+        # wasteful.. already computed logits..
+        logits = self._logits(x).reshape(-1, self.num_codebooks, self.codebook_size)
+        logits = logits.log_softmax(dim=2)
+        # chosen_logits: (B, num_codebooks, 1)
+        chosen_logits = torch.gather(logits, dim=2,
+                                     index=indexes.unsqueeze(2))
+        logprob_loss = -chosen_logits.mean()
 
-        Args:
-                x: the Tensor to quantize, of shape (*, dim)
-        Returns (reconstruction_loss, entropy_loss, frame_entropy), where:
-           reconstruction_loss: a scalar torch.Tensor containing the relative sum-squared
-                     reconstruction loss, constructed as an expectation over class probs.
-                     It is the sum-squared of (x - reconstructed_x) / sum-squared of x, which will
-                     for already-trained models be between 0 and 1, but could be greater than 1
-                     at the start of training.
-          entropy_loss:  the "relative entropy difference" between log(codebook_size) and the
-                    average entropy of each of the codebooks (taken over all frames together,
-                    i.e.  (ref_entropy - class_entropy) / ref_entropy, which is a number in [0,1].
-          frame_entropy: the average entropy of the codebooks on individual frames, between 0
-                    and log(codebook_size).  Training will tend to make this approach 0, but
-                    then training gets slow due to small derivatives, so we may want to
-                    bound it away from 0 at least in the earlier phases of training.
-        """
-        logits = self._logits(x)
+        # class_entropy
+        B = x.shape[0]
+        counts = torch.zeros(B, self.num_codebooks, self.codebook_size, device=x.device)
+        ones = torch.ones(1, 1, 1, device=x.device).expand(B, self.num_codebooks, self.codebook_size)
+        counts.scatter_(src=ones, dim=2, index=indexes.unsqueeze(2))
+        avg_counts = counts.mean(dim=0) + 1.0e-20
+        index_entropy = -(avg_counts * avg_counts.log()).sum(dim=1).mean()
 
-        # reshape logits to (B, self.num_codebooks, self.codebook_size) where B is the
-        # product of all dimensions of x except the last one.
-        logits = logits.reshape(-1, self.num_codebooks, self.codebook_size)
-        B = logits.shape[0]
-        probs = logits.softmax(dim=-1)
-        indexes = torch.distributions.categorical.Categorical(probs=probs).sample()
-        # indexes is of shape (B, self.num_codebooks) and contains elements in [0..codebook_size - 1]
-
-
-        # to_output_reshaped: (num_codebooks, codebook_size, dim)
-        to_output_reshaped = self.centers.reshape(self.num_codebooks, self.codebook_size, self.dim)
-        # indexes_expanded: (num_codebooks, B, dim)
-        indexes_expanded = indexes.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
-
-        # chosen_codebooks: (num_codebooks, B, dim).
-        chosen_codebooks = torch.gather(to_output_reshaped, dim=1, index=indexes_expanded)
-
-        # tot_codebooks: (1, B, dim), this is the sum of the chosen rows of `to_output` corresponding
-        # to the chosen codebook entries, this would correspond to the approximated x.
-        tot_codebooks = chosen_codebooks.sum(dim=0, keepdim=True)
-        # tot_error: (1, B, dim), the error of the approximated vs. real x.
-        tot_error = tot_codebooks - x.reshape(1, B, self.dim)
-        # tot_error_sumsq: scalar, total squared error.  only needed for diagnostics.
-        tot_error_sumsq = (tot_error**2).sum()
-
-        # The two args to _compute_diff_sumsq() below are:
-        #    a, of shape: (num_codebooks, 1, B, dim)
-        #    b, of shape: (num_codebooks, codebook_size, 1, dim)
-        # .. and the answer, which is equivalent to ((a+b)**2).sum(dim-1), is of shape
-        #    (num_codebooks, codebook_size, B)
-        # alt_error_sumsq answers the question: "what if, for this particular codebook, we had chosen this
-        # codebook entry; what would the sum-squared error be then?"
-        alt_error_sumsq = self._compute_diff_sumsq((tot_error - chosen_codebooks).unsqueeze(1),
-                                                   to_output_reshaped.unsqueeze(2))
-
-        # expected_error_sumsq is like tot_error_sumsq, but replaces the
-        # discrete choice with an expectation of the sum-sq error, taken over each codebook
-        # while leaving the choices of all the other codebooks fixed.
-        expected_error_sumsq = (alt_error_sumsq * probs.permute(1, 2, 0)).sum() - (tot_error_sumsq * (self.num_codebooks - 1))
-
-        x_tot_sumsq = (x ** 2).sum() + 1.0e-20
-
-        rel_tot_error_sumsq = tot_error_sumsq / x_tot_sumsq
-        rel_expected_error_sumsq = expected_error_sumsq / x_tot_sumsq
-
-        frame_entropy = -((probs * (probs+1.0e-20).log()).sum() / (B * self.num_codebooks))
-
-        # avg_probs: (self.num_codebooks, self.codebook_size)
-        avg_probs = probs.sum(0) / B
-        tot_entropy = -((avg_probs * (avg_probs+1.0e-20).log()).sum() / self.num_codebooks)
-        # 0 <= entropy_loss <= 1; it approaches 0 when tot_entropy approaches
-        # ref_entropy = log(self.codebook_size), which is its maximum possible value.
+        probs = logits.exp().mean(dim=0) + 1.0e-20
+        logits_entropy = -(probs * probs.log()).sum(dim=1).mean()
         ref_entropy = math.log(self.codebook_size)
-        entropy_loss = (ref_entropy - tot_entropy) / ref_entropy
 
-        return rel_expected_error_sumsq, entropy_loss, frame_entropy
+        logits_entropy_loss = (ref_entropy - logits_entropy) / ref_entropy
+        index_entropy_loss = (ref_entropy - index_entropy) / ref_entropy
 
+        return rel_reconstruction_loss, logprob_loss, logits_entropy_loss, index_entropy_loss
+
+
+class _WithDerivOf(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, y):
+        return x
+
+    @staticmethod
+    def backward(ctx, ans_deriv):
+        return None, ans_deriv # deriv goes to y only.
+
+def with_deriv_of(x: Tensor, y: Tensor)  -> Tensor:
+    """ Returns x but its deriv gets passed to y in backprop.. """
+    return _WithDerivOf.apply(x, y)
 
 class QuantizerTrainer(object):
     def __init__(self,
                  dim: int,
                  bytes_per_frame: int,
                  device: torch.device,
-                 phase_one_iters: int = 20000,
+                 phase_one_iters: int = 10000,
+                 phase_two_iters: int = 20000,
                  lr: float = 0.005):
         """
         Args:
@@ -500,6 +466,8 @@ class QuantizerTrainer(object):
                [Also, note: phase_one_iters should be larger for larger dims;
                for dim=256 and batch_size=600, 10k was enough, but for
                dim=512 and batch_size=600, 20k was better.
+         phase_two_iters:  The number of iterations to use for the second
+               phase of training (with codebook_size=256)
           lr: The initial learning rate.
 
         This object trains a Quantizer.  You can use it as follows:
@@ -520,12 +488,10 @@ class QuantizerTrainer(object):
         # num_codebooks=bytes_per_frame
 
         self.phase_one_iters = phase_one_iters
+        self.phase_two_iters = phase_two_iters
         self.cur_iter = 0
         self.lr = lr
-        self.frame_entropy_cutoff = torch.tensor(0.3, device=device)
-        self.entropy_scale = 0.02
-        self.det_loss_scale = 0.95  # should be in [0..1]
-
+        self.zero_iter_prob = 0.0
 
         self.quantizer = Quantizer(dim=dim, codebook_size=16,
                                    num_codebooks=bytes_per_frame*2).to(device)
@@ -537,11 +503,13 @@ class QuantizerTrainer(object):
             self.quantizer.parameters(), lr=self.lr, betas=(0.9, 0.98), eps=1e-9, weight_decay=1.0e-06
         )
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim,
-                                                         step_size=self.phase_one_iters/4,
+                                                         step_size=(self.phase_one_iters
+                                                                    if self.cur_iter == 0
+                                                                    else self.phase_two_iters)/4,
                                                          gamma=0.5)
 
     def done(self) -> bool:
-        return self.cur_iter >= 2 * self.phase_one_iters
+        return self.cur_iter > self.phase_one_iters + self.phase_two_iters
 
     def step(self, x: torch.Tensor) -> None:
         """
@@ -553,12 +521,13 @@ class QuantizerTrainer(object):
         """
         x = x.reshape(-1, self.quantizer.dim)
 
-        reconstruction_loss, entropy_loss, frame_entropy = self.quantizer.compute_loss(x)
-
-        det_loss = self.quantizer.compute_loss_deterministic(x, 1)
+        num_iters = 0 if random.random() < self.zero_iter_prob else 1
+        (reconstruction_loss, logprob_loss,
+         logits_entropy_loss, index_entropy_loss) = self.quantizer.compute_loss_deterministic(x,
+                                                                                              num_iters)
 
         if self.cur_iter % 200 == 0:
-            det_losses = [ float('%.3f' % self.quantizer.compute_loss_deterministic(x, j).item())
+            det_losses = [ float('%.3f' % self.quantizer.compute_loss_deterministic(x, j)[0].item())
                            for j in range(4) ]
             phase = 1 if self.cur_iter <= self.phase_one_iters else 2
             i = self.cur_iter - self.phase_one_iters if phase > 1 else self.cur_iter
@@ -570,16 +539,18 @@ class QuantizerTrainer(object):
             logging.info(f"phase={phase}/2, iter={i}, "
                          f"dim,nc,csz={self.quantizer.dim},{self.quantizer.num_codebooks},{self.quantizer.codebook_size}, "
                          f"loss_per_iter={det_losses}, "
-                         f"soft_loss={reconstruction_loss.item():.3f}, "
-                         f"entropy_loss={entropy_loss.item():.3f}, frame_entropy={frame_entropy.item():.3f}")
+                         f"logprob_loss={logprob_loss.item():.3f}, "
+                         f"logits_entropy_loss={logits_entropy_loss.item():.3f}, "
+                         f"index_entropy_loss={index_entropy_loss.item():.3f}")
 
+        entropy_scale = 0.0
         # reconstruction_loss >= 0, equals 0 when reconstruction is exact.
-        tot_loss = (reconstruction_loss * (1 - self.det_loss_scale) +
-                    det_loss * self.det_loss_scale +
-                    entropy_loss * self.entropy_scale)
+        tot_loss = (reconstruction_loss +
+                    logprob_loss +
+                    logits_entropy_loss * entropy_scale)
         # We want to maximize frame_entropy if it is less than frame_entropy_cutoff.
-        tot_loss -= torch.minimum(self.frame_entropy_cutoff,
-                                  frame_entropy)
+        #tot_loss -= torch.minimum(self.frame_entropy_cutoff,
+        #                          frame_entropy)
 
         tot_loss.backward()
         self.optim.step()
@@ -595,7 +566,6 @@ class QuantizerTrainer(object):
         This is to be called exactly once, when self.cur_iter reaches self.phase_one_iters
         """
         self.quantizer = self.quantizer.get_product_quantizer()
-        self.frame_entropy_cutoff = self.frame_entropy_cutoff * 1.25
         self.lr *= 0.5
         self._init_optimizer()
 
