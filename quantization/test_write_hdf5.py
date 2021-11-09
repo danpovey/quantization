@@ -18,11 +18,11 @@ def _write_example_data():
     ).to(device)
     model.eval()
 
-    num_tensors = 2000
+    num_frames = 5000000 # 5 million frames
+    B = 1024 # batch size
+    num_tensors = num_frames // B
     filename = 'training_data.hdf5'
     hf = h5py.File(filename, 'w')
-
-    B = 600 # batch size
 
     for i in range(num_tensors):
         x = torch.randn(B, dim, device=device)

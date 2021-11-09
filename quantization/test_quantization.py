@@ -191,6 +191,6 @@ def _test_quantization():
 
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
-    _test_quantizer_trainer_double()
     _test_quantizer_trainer()
+    _test_quantizer_trainer_double()
     _test_quantization()
