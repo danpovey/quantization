@@ -78,7 +78,7 @@ class Quantizer(nn.Module):
 
 
     def encode(self,
-               x: Tensor, refine_indexes_iters: int = 3,
+               x: Tensor, refine_indexes_iters: int = 5,
                as_bytes: bool = True) -> Tensor:
         """
         Compute the quantized output, that can be used to reconstruct x.
@@ -110,7 +110,7 @@ class Quantizer(nn.Module):
 
         return indexes.reshape(*x.shape[:-1], -1)
 
-    def _compute_indexes(self, x: Tensor, refine_indexes_iters: int = 2) -> Tensor:
+    def _compute_indexes(self, x: Tensor, refine_indexes_iters: int = 3) -> Tensor:
         """
         Deterministically compute the indexes that encode the tensor x.
 
@@ -269,7 +269,7 @@ class Quantizer(nn.Module):
         modified_sumsq_errs.scatter_(dim=2, index=indexes.unsqueeze(-1), src=src)
 
 
-        if self.codebook_size <= 16:
+        if self.codebook_size <= 16 or (i >= 2 and i % 2 == 0):
             N = 2 # for small codebook sizes, it's sufficient to search among the top-2.
             codebooks_per_group = min(8, self.num_codebooks)
         else:
@@ -426,22 +426,21 @@ class Quantizer(nn.Module):
         return x_approx.reshape(*orig_shape[:-1], self.dim)
 
 
-    def compute_loss_deterministic(self, x: Tensor, refine_indexes_iters: int = 0) -> Tensor:
+    def compute_loss(self, x: Tensor, refine_indexes_iters: int = 0) -> Tensor:
         """
-        Compute the loss function with deterministic indexes using argmax not sampling.
-        Like compute_loss(), the result is differentiable w.r.t self.centers but
-        gives no derivative for self.to_logits
+        Compute various parts of the loss function.
 
         Args:
-                x: the Tensor to quantize, of shape (*, dim)
+            x: the Tensor to quantize, of shape (*, dim)
            refine_indexes_iters: a number >= 0: the number of iterations to refine
                 the indexes from their initial value.
 
         Returns: (rel_reconstruction_loss, logprob_loss, entropy_loss, index_entropy_loss), where
              rel_reconstruction_loss:  a scalar torch.Tensor containing the relative sum-squared
-                    reconstruction loss.
-                    It is the sum-squared of (x - reconstructed_x) / sum-squared of x, which will
-                    for already-trained models be between 0 and 1, but could be greater than 1
+                    reconstruction loss, based on the indexes chosen after `refine_indexes_iters`
+                    iterations of refinement after the argmax of the logits.  This loss is
+                    is the sum-squared of (x - reconstructed_x) / sum-squared of x, which
+                    for already-trained models will be between 0 and 1, but could be greater than 1
                     at the start of training.
              logprob_loss: the negative average logprob of the selected classes (i.e. those
                    selected after refine_indexes_iters of refinement).  This is added to the
@@ -579,12 +578,12 @@ class QuantizerTrainer(object):
 
         num_iters = 2 if random.random() < self.two_iter_prob else 1
         (reconstruction_loss, logprob_loss,
-         logits_entropy_loss, index_entropy_loss) = self.quantizer.compute_loss_deterministic(x,
-                                                                                              num_iters)
+         logits_entropy_loss, index_entropy_loss) = self.quantizer.compute_loss(x, num_iters)
+
 
         if self.cur_iter % 200 == 0:
-            det_losses = [ float('%.3f' % self.quantizer.compute_loss_deterministic(x, j)[0].item())
-                           for j in range(4) ]
+            det_losses = [ float('%.3f' % self.quantizer.compute_loss(x, j)[0].item())
+                           for j in range(6) ]
             phase = 1 if self.cur_iter <= self.phase_one_iters else 2
             i = self.cur_iter - self.phase_one_iters if phase > 1 else self.cur_iter
             # Caution: python's logging level is logging.ERROR by default.  To make the following
