@@ -233,7 +233,7 @@ class Quantizer(nn.Module):
                   than `indexes`.  This algorithm is not exact, but if the codebooks are
                   fairly orthogonal it should work fine.   If they are not fairly orthogonal
                   it may not optimize well, but hopefully the codebooks will then learn
-                  to be more orthogona..
+                  to be more orthogonal.
         """
         B = indexes.shape[0]
         # indexes_expanded has shape (B, self.num_codebooks, 1, self.dim)
@@ -444,12 +444,13 @@ class Quantizer(nn.Module):
                     for already-trained models be between 0 and 1, but could be greater than 1
                     at the start of training.
              logprob_loss: the negative average logprob of the selected classes (i.e. those
-                   selected after refine_indexes_iters of refinement).
-             logits_entropy_loss: the class entropy loss, from the logits which approaches zero when all classes
-                   of all codebooks are equi-probable (in the logits output).
-             index_entropy_loss: the class entropy loss, from the computed indexes,  which approaches zero when all classes
-                   of all codebooks are equi-probable (in the indexes output).  Not differentiable but useful
-                   for diagnostics.
+                   selected after refine_indexes_iters of refinement).  This is added to the
+                   loss function, so we can select reasonable classes before refining the indexes.
+             logits_entropy_loss: the class entropy loss, from the logits, which approaches
+                   zero when all classes of all codebooks are equi-probable (in the logits output).
+             index_entropy_loss: the class entropy loss, from the computed indexes,  which approaches
+                  zero when all classes of all codebooks are equi-probable (in the indexes output).
+                  Not differentiable but useful for diagnostics.
         """
         x = x.reshape(-1, self.dim)
         indexes = self._compute_indexes(x, refine_indexes_iters)
@@ -546,7 +547,7 @@ class QuantizerTrainer(object):
         self.phase_two_iters = phase_two_iters
         self.cur_iter = 0
         self.lr = lr
-        self.zero_iter_prob = 0.0
+        self.two_iter_prob = 0.5
 
         self.quantizer = Quantizer(dim=dim, codebook_size=16,
                                    num_codebooks=bytes_per_frame*2).to(device)
@@ -576,7 +577,7 @@ class QuantizerTrainer(object):
         """
         x = x.reshape(-1, self.quantizer.dim)
 
-        num_iters = 0 if random.random() < self.zero_iter_prob else 1
+        num_iters = 2 if random.random() < self.two_iter_prob else 1
         (reconstruction_loss, logprob_loss,
          logits_entropy_loss, index_entropy_loss) = self.quantizer.compute_loss_deterministic(x,
                                                                                               num_iters)
@@ -599,7 +600,30 @@ class QuantizerTrainer(object):
                          f"index_entropy_loss={index_entropy_loss.item():.3f}")
 
         entropy_scale = 0.0
-        # reconstruction_loss >= 0, equals 0 when reconstruction is exact.
+        # About the losses:
+        # - reconstruction_loss >= 0; it equals 0 when reconstruction is exact.
+        #   This is the main loss function, used to train quantizer.centers
+        # - logprob_loss trains only quantizer.to_logits, which predicts the
+        #   indexes after refinement, so we can initialize them well; it does
+        #   not affect the cluster centers.
+        # - logits_entropy_loss is currently not used for training, since we
+        #   set entropy_scale = 0 above.  It would affect only to_logits, if
+        #   used.  The intention was that this might solve problem with
+        #   cluster centers having very uneven probabilities of being chosen
+        #   (it would do this by biasing the initial choice, relying on
+        #   the inexactness of the search).  In our experiments,
+        #   logits entropy_loss and index_entropy_loss both end up
+        #   less than 0.05, so this does not seem to be a problem in practice,
+        #   but it might be a problem if, say, the inputs had a very tiny scale,
+        #   so we are keeping the code around.
+        # - index_entropy_loss is not differentiable; we have
+        #   added it only for diagnostic purposes.  It reflects the entropy of
+        #   the distribution over classes, after refining the cluster indexes.
+        #   It was computed just in case regularizing logits_entropy_loss was
+        #   not enough to affect the final distribution over cluster centers,
+        #   so we could diagnose the problem; but we found no problem in practice.
+        #
+
         tot_loss = (reconstruction_loss +
                     logprob_loss +
                     logits_entropy_loss * entropy_scale)
