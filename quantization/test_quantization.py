@@ -66,19 +66,31 @@ def _test_quantizer_trainer_double():
     trainer = QuantizerTrainer(dim=512, bytes_per_frame=8,
                                device=torch.device('cuda'),
                                phase_one_iters=20000)
+
     B = 600
-    while not trainer.done():
+    def generate_x():
         x1 = torch.randn(B, dim, device=device)
         x2 = torch.randn(B, dim, device=device)
         x1 = model(x1)  + 0.05 * x1
         x2 = model(x2)  + 0.05 * x2
-        x = torch.cat((x1, x2), dim=1)
-        trainer.step(x)
-    print("Done testing dim=512, doubled...")
+        return torch.cat((x1, x2), dim=1)
 
+    while not trainer.done():
+        trainer.step(generate_x())
+
+    quantizer = trainer.get_quantizer() # of type Quantizer
+
+    k = 30
+    avg_rel_err = 0
+    for i in range(k):
+        x = generate_x()
+        x_approx = quantizer.decode(quantizer.encode(x))
+        avg_rel_err += (1/k) * ((x-x_approx)**2).sum() / (x**2).sum()
+
+    print("Done testing dim=512(=256,doubled); avg relative approximation error = ", avg_rel_err.item())
 
 
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
-    _test_quantizer_trainer()
     _test_quantizer_trainer_double()
+    _test_quantizer_trainer()
