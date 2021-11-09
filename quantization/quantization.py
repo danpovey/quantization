@@ -321,7 +321,16 @@ class Quantizer(nn.Module):
         comb_indexes, comb_mat = self._get_combinations(codebooks_per_group,
                                                         N, indexes.device)
 
-        for begin_c in range(0, self.num_codebooks, codebooks_per_group):
+
+        # If there are multiple blocks, we randomize the order (we don't always
+        # start from the lowest-numbered block).
+        num_blocks = self.num_codebooks // codebooks_per_group
+        rand_offset = codebooks_per_group * random.randint(0, num_blocks - 1)
+
+        for _begin_c in range(0, self.num_codebooks, codebooks_per_group):
+            # randomize the first one to optimize.  Otherwise the first codebooks tend to
+            # "dominate" (get the most useful variation).
+            begin_c = (_begin_c + rand_offset) % self.num_codebooks
             end_c = begin_c + codebooks_per_group
 
             this_proposed_deltas = proposed_deltas[:,:,begin_c:end_c,:].reshape(
@@ -425,6 +434,35 @@ class Quantizer(nn.Module):
         x_approx = chosen_codebooks.sum(dim=0)
         return x_approx.reshape(*orig_shape[:-1], self.dim)
 
+    def compute_codebook_correlations(self) -> Tensor:
+        """
+        Return a Tensor of shape (self.num_codebooks, self.num_codebooks)
+        with values >= 0, which are greater if a pair of codebooks more strongly
+        shares a subspace.
+        """
+        centers = self.centers.reshape(self.num_codebooks,
+                                       self.codebook_size,
+                                       self.dim).detach()
+        codebook_means = centers.mean(dim=1, keepdim=True) # (num_codebooks, 1, dim)
+        centers = centers - codebook_means # make each codebook zero-mean.
+
+        # variances: (num_codebooks, dim, dim)
+        variances = torch.matmul(centers.transpose(1, 2), centers)
+
+        # variances_flat: (num_codebooks, dim * dim)
+        variances_flat = variances.reshape(self.num_codebooks,
+                                           self.dim * self.dim)
+
+        # cross_variances: (num_codebooks, num_codebooks), should be all positive
+        # (interpret these as tr(0.5*(V1 * V2 + V2 * V1)) == tr(V1 * V2) ==
+        # the sum of products of corresponding elements (for this, we use the fact
+        # that V1 and V2 are both symmetric).
+        cross_variances = torch.matmul(variances_flat, variances_flat.t())
+
+        normalizer = cross_variances.diag() ** -0.5
+        normalizer = normalizer.unsqueeze(0) * normalizer.unsqueeze(1)
+        return cross_variances * normalizer
+
 
     def compute_loss(self, x: Tensor, refine_indexes_iters: int = 0) -> Tensor:
         """
@@ -485,18 +523,6 @@ class Quantizer(nn.Module):
         return rel_reconstruction_loss, logprob_loss, logits_entropy_loss, index_entropy_loss
 
 
-class _WithDerivOf(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, y):
-        return x
-
-    @staticmethod
-    def backward(ctx, ans_deriv):
-        return None, ans_deriv # deriv goes to y only.
-
-def with_deriv_of(x: Tensor, y: Tensor)  -> Tensor:
-    """ Returns x but its deriv gets passed to y in backprop.. """
-    return _WithDerivOf.apply(x, y)
 
 class QuantizerTrainer(object):
     def __init__(self,
@@ -597,6 +623,10 @@ class QuantizerTrainer(object):
                          f"logprob_loss={logprob_loss.item():.3f}, "
                          f"logits_entropy_loss={logits_entropy_loss.item():.3f}, "
                          f"index_entropy_loss={index_entropy_loss.item():.3f}")
+
+        if self.cur_iter % 2000 == 0:
+            correlations = self.quantizer.compute_codebook_correlations()
+            logging.info(f"correlations = {correlations}")
 
         entropy_scale = 0.0
         # About the losses:
