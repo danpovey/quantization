@@ -1,6 +1,8 @@
+import binascii
 import h5py
 import math
 import numpy as np
+import os
 import time
 import torch
 import random
@@ -36,15 +38,37 @@ class Quantizer(nn.Module):
         self.to_logits = nn.Linear(dim, codebook_size * num_codebooks)
         self.logits_scale = 4
 
-        # we will sometimes interpret self.centers, which is of shape
-        # (num_codebooks * codebook_size, dim), as being of shape
-        # (num_codebooks, codebook_size, dim); and similarly with self.to_logits
-        self.centers = nn.Parameter(self.to_logits.weight.detach().clone())
+        # self.centers: (num_codebooks, codebook_size, dim)
+        self.centers = nn.Parameter(self.to_logits.weight.detach().clone().reshape(
+            num_codebooks, codebook_size, dim))
 
+        # We give each Quantizer a unique 8-digit hex identifier, which we'll use to reduce the
+        # probability of mixing up the outputs of different Quantizers.
+        # It is saved as a buffer, as well as a string, so that it will be loaded
+        # from disk when we use load_state_dict().
+        id_bytes = binascii.b2a_hex(os.urandom(4))  # random hex string, e.g. b'585ce3cf'
+        self.id_str = id_bytes.decode('utf-8')
+        self.register_buffer('id_buf', torch.tensor(list(id_bytes), dtype=torch.uint8))
 
+    def load_state_dict(self, *args, **kwargs):
+        super(Quantizer, self).load_state_dict(*args, **kwargs)
+        self.id_str = bytes(self.id_buf.tolist()).decode('utf-8')
+
+    def get_id(self) -> str:
+        return self.id_str
 
     def show_init_invocation(self) -> str:
         return f"quantization.Quantizer(dim={self.dim}, codebook_size={self.codebook_size}, num_codebooks={self.num_codebooks})"
+
+    def get_data_mean(self) -> Tensor:
+        """
+        Return an approximate expression for the mean of the training data, as a tensor
+        of shape (dim,).  This is useful for diagnostics.  It is detached from gradient,
+        to avoid this affecting the optimization.
+        The expression we use assumes balanced codebook probabilities, which is true
+        in practice (as long as index_entropy_loss in training is fairly small).
+        """
+        return self.centers.mean(dim=1).sum(dim=0).detach()
 
 
     def get_product_quantizer(self) -> 'Quantizer':
@@ -74,12 +98,135 @@ class Quantizer(nn.Module):
                         row_out = new_codebook_size * c_out + k_out
                         ans.to_logits.weight[row_out,:] = self.to_logits.weight[row_in1] + self.to_logits.weight[row_in2]
                         ans.to_logits.bias[row_out] = self.to_logits.bias[row_in1] + self.to_logits.bias[row_in2]
-                        ans.centers[row_out,:] = self.centers[row_in1] + self.centers[row_in2]
+                        ans.centers[c_out, k_out, :] = self.centers[c_in1, k_in1, :] + self.centers[c_in2, k_in2, :]
         return ans
 
-    def _logits(self, x: Tensor) -> Tensor:
-        return self.to_logits(x) * self.logits_scale
 
+
+
+    def decode(self, indexes: Tensor) -> Tensor:
+        """
+        Does the (approximate) inverse of _compute_indexes(): constructs from `indexes` the
+        corresponding approximated tensor.
+        Args:
+             indexes:
+                    May be an integer tensor of shape (*, self.num_codebooks), with entries
+                    in {0..self.num_codebooks-1}
+                    May also contain multiple codebook entries combined into one integer, as
+                    done by encode() with as_bytes==True; in this case the last dim
+                    might be self.num_codebooks/2 or self.num_codebooks/4.
+        Returns: a tensor of shape (*, self.dim), consisting of the sum of the specified
+                cluster centers.
+        """
+        orig_shape = indexes.shape
+        indexes = indexes.reshape(-1, indexes.shape[-1])
+        indexes = self._maybe_separate_indexes(indexes).to(dtype=torch.int64)
+
+        assert indexes.ndim == 2
+        B = indexes.shape[0]
+        # indexes_expanded: (num_codebooks, B, dim)
+        indexes_expanded = indexes.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
+        # self.centers: (num_codebooks, codebook_size, dim)
+        # chosen_codebooks: (num_codebooks, B, dim).
+        chosen_codebooks = torch.gather(self.centers, dim=1, index=indexes_expanded)
+
+        # x_approx: (B, dim), this is the sum of the chosen rows of `to_output`
+        # corresponding to the chosen codebook entries, this would correspond to
+        # the approximated x.
+        x_approx = chosen_codebooks.sum(dim=0)
+        return x_approx.reshape(*orig_shape[:-1], self.dim)
+
+    def compute_codebook_correlations(self) -> Tensor:
+        """
+        Return a Tensor of shape (self.num_codebooks, self.num_codebooks)
+        with values >= 0, which are greater if a pair of codebooks more strongly
+        shares a subspace.  This is for diagnostic purposes.
+        These correlations are computed by:
+          - subtracting the mean value from each codebook
+          - creating an uncentered variance S_i for each codebook i
+          - computing, for each pair of codebooks i and j, c_{ij} = tr(S_i S_j)
+          - returning c_{ij} / sqrt(c_{ii} c_{ij}), which is a symmetric
+            matrix with values in [0,1]
+        """
+        centers = self.centers.detach()
+        codebook_means = centers.mean(dim=1, keepdim=True) # (num_codebooks, 1, dim)
+        centers = centers - codebook_means # make each codebook zero-mean.
+
+        # variances: (num_codebooks, dim, dim)
+        variances = torch.matmul(centers.transpose(1, 2), centers)
+
+        # variances_flat: (num_codebooks, dim * dim)
+        variances_flat = variances.reshape(self.num_codebooks,
+                                           self.dim * self.dim)
+
+        # cross_variances: (num_codebooks, num_codebooks), should be all positive
+        # (interpret these as tr(0.5*(V1 * V2 + V2 * V1)) == tr(V1 * V2) ==
+        # the sum of products of corresponding elements (for this, we use the fact
+        # that V1 and V2 are both symmetric).
+        cross_variances = torch.matmul(variances_flat, variances_flat.t())
+
+        normalizer = cross_variances.diag() ** -0.5
+        normalizer = normalizer.unsqueeze(0) * normalizer.unsqueeze(1)
+        return cross_variances * normalizer
+
+
+    def compute_loss(self, x: Tensor, refine_indexes_iters: int = 0) -> Tensor:
+        """
+        Compute various parts of the loss function.
+
+        Args:
+            x: the Tensor to quantize, of shape (*, dim)
+           refine_indexes_iters: a number >= 0: the number of iterations to refine
+                the indexes from their initial value.
+
+        Returns: (rel_reconstruction_loss, logprob_loss, entropy_loss, index_entropy_loss), where
+             rel_reconstruction_loss:  a scalar torch.Tensor containing the relative sum-squared
+                    reconstruction loss, based on the indexes chosen after `refine_indexes_iters`
+                    iterations of refinement after the argmax of the logits.  This loss is
+                    is the sum-squared of (x - reconstructed_x) / (sum-squared of x-x_mean), which
+                    for already-trained models will be between 0 and 1, but could be greater than 1
+                    at the start of training.
+             logprob_loss: the negative average logprob of the selected classes (i.e. those
+                   selected after refine_indexes_iters of refinement).  This is added to the
+                   loss function, so we can select reasonable classes before refining the indexes.
+             logits_entropy_loss: the class entropy loss, from the logits, which approaches
+                   zero when all classes of all codebooks are equi-probable (in the logits output).
+             index_entropy_loss: the class entropy loss, from the computed indexes,  which approaches
+                  zero when all classes of all codebooks are equi-probable (in the indexes output).
+                  Not differentiable but useful for diagnostics.
+        """
+        x = x.reshape(-1, self.dim)
+        indexes = self._compute_indexes(x, refine_indexes_iters)
+        x_approx = self.decode(indexes)
+        # tot_error: (B, dim), the error of the approximated vs. real x.
+        tot_error = x_approx - x
+        rel_reconstruction_loss = (tot_error**2).sum() / (((x - self.get_data_mean()) ** 2).sum() + 1.0e-20)
+
+        # Get logprob loss and class-entropy loss
+        # wasteful.. already computed logits..
+        logits = self._logits(x).reshape(-1, self.num_codebooks, self.codebook_size)
+        logits = logits.log_softmax(dim=2)
+        # chosen_logits: (B, num_codebooks, 1)
+        chosen_logits = torch.gather(logits, dim=2,
+                                     index=indexes.unsqueeze(2))
+        logprob_loss = -chosen_logits.mean()
+
+        # class_entropy
+        B = x.shape[0]
+        counts = torch.zeros(B, self.num_codebooks, self.codebook_size, device=x.device)
+        ones = torch.ones(1, 1, 1, device=x.device).expand(B, self.num_codebooks, self.codebook_size)
+        counts.scatter_(src=ones, dim=2, index=indexes.unsqueeze(2))
+        avg_counts = counts.mean(dim=0) + 1.0e-20
+        index_entropy = -(avg_counts * avg_counts.log()).sum(dim=1).mean()
+
+        probs = logits.exp().mean(dim=0) + 1.0e-20
+        logits_entropy = -(probs * probs.log()).sum(dim=1).mean()
+        ref_entropy = math.log(self.codebook_size)
+
+        logits_entropy_loss = (ref_entropy - logits_entropy) / ref_entropy
+        index_entropy_loss = (ref_entropy - index_entropy) / ref_entropy
+
+        return rel_reconstruction_loss, logprob_loss, logits_entropy_loss, index_entropy_loss
 
     def encode(self,
                x: Tensor, refine_indexes_iters: int = 5,
@@ -113,6 +260,9 @@ class Quantizer(nn.Module):
 
 
         return indexes.reshape(*x.shape[:-1], -1)
+
+    def _logits(self, x: Tensor) -> Tensor:
+        return self.to_logits(x) * self.logits_scale
 
     def _compute_indexes(self, x: Tensor, refine_indexes_iters: int = 3) -> Tensor:
         """
@@ -165,7 +315,7 @@ class Quantizer(nn.Module):
         # indexes_expanded has shape (B, self.num_codebooks, 1, self.dim)
         indexes_expanded = indexes.unsqueeze(-1).unsqueeze(-1).expand(B, self.num_codebooks, 1, self.dim)
         # all_centers: (1, num_codebooks, codebook_size, dim)
-        all_centers = self.centers.reshape(1, self.num_codebooks, self.codebook_size, self.dim)
+        all_centers = self.centers.unsqueeze(0)
         # centers_expanded has shape (B, self.num_codebooks, self.codebook_size, self.dim)
         centers_expanded = all_centers.expand(B, self.num_codebooks, self.codebook_size, self.dim)
 
@@ -335,142 +485,13 @@ class Quantizer(nn.Module):
 
 
 
-    def decode(self, indexes: Tensor) -> Tensor:
-        """
-        Does the (approximate) inverse of _compute_indexes(): constructs from `indexes` the
-        corresponding approximated tensor.
-        Args:
-             indexes:
-                    May be an integer tensor of shape (*, self.num_codebooks), with entries
-                    in {0..self.num_codebooks-1}
-                    May also contain multiple codebook entries combined into one integer, as
-                    done by encode() with as_bytes==True; in this case the last dim
-                    might be self.num_codebooks/2 or self.num_codebooks/4.
-        Returns: a tensor of shape (*, self.dim), consisting of the sum of the specified
-                cluster centers.
-        """
-        orig_shape = indexes.shape
-        indexes = indexes.reshape(-1, indexes.shape[-1])
-        indexes = self._maybe_separate_indexes(indexes).to(dtype=torch.int64)
-
-        assert indexes.ndim == 2
-        B = indexes.shape[0]
-        # indexes_expanded: (num_codebooks, B, dim)
-        indexes_expanded = indexes.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
-        # to_output_reshaped: (num_codebooks, codebook_size, dim)
-        to_output_reshaped = self.centers.reshape(self.num_codebooks, self.codebook_size, self.dim)
-        # chosen_codebooks: (num_codebooks, B, dim).
-        chosen_codebooks = torch.gather(to_output_reshaped, dim=1, index=indexes_expanded)
-
-        # x_approx: (B, dim), this is the sum of the chosen rows of `to_output`
-        # corresponding to the chosen codebook entries, this would correspond to
-        # the approximated x.
-        x_approx = chosen_codebooks.sum(dim=0)
-        return x_approx.reshape(*orig_shape[:-1], self.dim)
-
-    def compute_codebook_correlations(self) -> Tensor:
-        """
-        Return a Tensor of shape (self.num_codebooks, self.num_codebooks)
-        with values >= 0, which are greater if a pair of codebooks more strongly
-        shares a subspace.  This is for diagnostic purposes.
-        These correlations are computed by:
-          - subtracting the mean value from each codebook
-          - creating an uncentered variance S_i for each codebook i
-          - computing, for each pair of codebooks i and j, c_{ij} = tr(S_i S_j)
-          - returning c_{ij} / sqrt(c_{ii} c_{ij}), which is a symmetric
-            matrix with values in [0,1]
-        """
-        centers = self.centers.reshape(self.num_codebooks,
-                                       self.codebook_size,
-                                       self.dim).detach()
-        codebook_means = centers.mean(dim=1, keepdim=True) # (num_codebooks, 1, dim)
-        centers = centers - codebook_means # make each codebook zero-mean.
-
-        # variances: (num_codebooks, dim, dim)
-        variances = torch.matmul(centers.transpose(1, 2), centers)
-
-        # variances_flat: (num_codebooks, dim * dim)
-        variances_flat = variances.reshape(self.num_codebooks,
-                                           self.dim * self.dim)
-
-        # cross_variances: (num_codebooks, num_codebooks), should be all positive
-        # (interpret these as tr(0.5*(V1 * V2 + V2 * V1)) == tr(V1 * V2) ==
-        # the sum of products of corresponding elements (for this, we use the fact
-        # that V1 and V2 are both symmetric).
-        cross_variances = torch.matmul(variances_flat, variances_flat.t())
-
-        normalizer = cross_variances.diag() ** -0.5
-        normalizer = normalizer.unsqueeze(0) * normalizer.unsqueeze(1)
-        return cross_variances * normalizer
-
-
-    def compute_loss(self, x: Tensor, refine_indexes_iters: int = 0) -> Tensor:
-        """
-        Compute various parts of the loss function.
-
-        Args:
-            x: the Tensor to quantize, of shape (*, dim)
-           refine_indexes_iters: a number >= 0: the number of iterations to refine
-                the indexes from their initial value.
-
-        Returns: (rel_reconstruction_loss, logprob_loss, entropy_loss, index_entropy_loss), where
-             rel_reconstruction_loss:  a scalar torch.Tensor containing the relative sum-squared
-                    reconstruction loss, based on the indexes chosen after `refine_indexes_iters`
-                    iterations of refinement after the argmax of the logits.  This loss is
-                    is the sum-squared of (x - reconstructed_x) / sum-squared of x, which
-                    for already-trained models will be between 0 and 1, but could be greater than 1
-                    at the start of training.
-             logprob_loss: the negative average logprob of the selected classes (i.e. those
-                   selected after refine_indexes_iters of refinement).  This is added to the
-                   loss function, so we can select reasonable classes before refining the indexes.
-             logits_entropy_loss: the class entropy loss, from the logits, which approaches
-                   zero when all classes of all codebooks are equi-probable (in the logits output).
-             index_entropy_loss: the class entropy loss, from the computed indexes,  which approaches
-                  zero when all classes of all codebooks are equi-probable (in the indexes output).
-                  Not differentiable but useful for diagnostics.
-        """
-        x = x.reshape(-1, self.dim)
-        indexes = self._compute_indexes(x, refine_indexes_iters)
-        x_approx = self.decode(indexes)
-        # tot_error: (B, dim), the error of the approximated vs. real x.
-        tot_error = x_approx - x
-        rel_reconstruction_loss = (tot_error**2).sum() / ((x ** 2).sum() + 1.0e-20)
-
-        # Get logprob loss and class-entropy loss
-        # wasteful.. already computed logits..
-        logits = self._logits(x).reshape(-1, self.num_codebooks, self.codebook_size)
-        logits = logits.log_softmax(dim=2)
-        # chosen_logits: (B, num_codebooks, 1)
-        chosen_logits = torch.gather(logits, dim=2,
-                                     index=indexes.unsqueeze(2))
-        logprob_loss = -chosen_logits.mean()
-
-        # class_entropy
-        B = x.shape[0]
-        counts = torch.zeros(B, self.num_codebooks, self.codebook_size, device=x.device)
-        ones = torch.ones(1, 1, 1, device=x.device).expand(B, self.num_codebooks, self.codebook_size)
-        counts.scatter_(src=ones, dim=2, index=indexes.unsqueeze(2))
-        avg_counts = counts.mean(dim=0) + 1.0e-20
-        index_entropy = -(avg_counts * avg_counts.log()).sum(dim=1).mean()
-
-        probs = logits.exp().mean(dim=0) + 1.0e-20
-        logits_entropy = -(probs * probs.log()).sum(dim=1).mean()
-        ref_entropy = math.log(self.codebook_size)
-
-        logits_entropy_loss = (ref_entropy - logits_entropy) / ref_entropy
-        index_entropy_loss = (ref_entropy - index_entropy) / ref_entropy
-
-        return rel_reconstruction_loss, logprob_loss, logits_entropy_loss, index_entropy_loss
-
-
-
 class QuantizerTrainer(object):
     def __init__(self,
                  dim: int,
                  bytes_per_frame: int,
                  device: torch.device,
                  phase_one_iters: int = 10000,
-                 phase_two_iters: int = 20000,
+                 phase_two_iters: int = 10000,
                  lr: float = 0.005):
         """
         Args:
@@ -520,17 +541,6 @@ class QuantizerTrainer(object):
         self._init_optimizer()
 
 
-
-    def _init_optimizer(self):
-        self.optim = torch.optim.Adam(
-            self.quantizer.parameters(), lr=self.lr, betas=(0.9, 0.98), eps=1e-9, weight_decay=1.0e-06
-        )
-        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim,
-                                                         step_size=(self.phase_one_iters
-                                                                    if self.cur_iter == 0
-                                                                    else self.phase_two_iters)/4,
-                                                         gamma=0.5)
-
     def done(self) -> bool:
         ans = self.cur_iter > self.phase_one_iters + self.phase_two_iters
         if ans:
@@ -575,7 +585,13 @@ class QuantizerTrainer(object):
             correlations = self.quantizer.compute_codebook_correlations()
             logging.info(f"correlations = {correlations}")
 
-        entropy_scale = 0.0
+        # We did not find it necessary to use entropy_scale -- the
+        # logits_entropy_loss and index_entropy_loss are less than 0.01 even
+        # with entropy_scale == 0 -- but we are putting a nonzero value on
+        # entropy_scale just out of an abundance of caution, in case an unusual
+        # data distribution might cause problems in the future.
+        entropy_scale = 0.01
+
         # About the losses:
         # - reconstruction_loss >= 0; it equals 0 when reconstruction is exact.
         #   This is the main loss function, used to train quantizer.centers
@@ -616,6 +632,17 @@ class QuantizerTrainer(object):
             self._begin_second_phase()
         self.cur_iter += 1
 
+
+    def _init_optimizer(self):
+        self.optim = torch.optim.Adam(
+            self.quantizer.parameters(), lr=self.lr, betas=(0.9, 0.98), eps=1e-9, weight_decay=1.0e-06
+        )
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optim,
+                                                         step_size=(self.phase_one_iters
+                                                                    if self.cur_iter == 0
+                                                                    else self.phase_two_iters)/4,
+                                                         gamma=0.5)
+
     def _begin_second_phase(self):
         """
         This is to be called exactly once, when self.cur_iter reaches self.phase_one_iters
@@ -625,7 +652,7 @@ class QuantizerTrainer(object):
         self._init_optimizer()
 
     def get_quantizer(self) -> Quantizer:
-        assert self.cur_iter >= 2 * self.phase_one_iters
+        assert self.cur_iter >= self.phase_one_iters + self.phase_two_iters
         return self.quantizer
 
 

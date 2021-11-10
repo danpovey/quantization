@@ -22,7 +22,6 @@ def _test_quantizer_trainer():
         nn.Linear(dim, dim),
     ).to(device)
     trainer = QuantizerTrainer(dim=dim, bytes_per_frame=4,
-                               phase_one_iters=10000,
                                device=torch.device('cuda'))
 
     B = 600
@@ -35,13 +34,14 @@ def _test_quantizer_trainer():
         trainer.step(generate_x())
 
     quantizer = trainer.get_quantizer() # of type Quantizer
+    x_mean = quantizer.get_data_mean()
 
     k = 30
     avg_rel_err = 0
     for i in range(k):
         x = generate_x()
         x_approx = quantizer.decode(quantizer.encode(x))
-        avg_rel_err += (1/k) * ((x-x_approx)**2).sum() / (x**2).sum()
+        avg_rel_err += (1/k) * ((x-x_approx)**2).sum() / ((x-x_mean)**2).sum()
 
     print("Done testing dim=256, avg relative approximation error = ", avg_rel_err.item())
 
@@ -59,7 +59,6 @@ def _test_quantizer_trainer_gaussian():
     print(f"Testing dim={dim}, gaussian input, bytes_per_frame={bytes_per_frame}, shannon_distortion={shannon_distortion:.5f}")
     trainer = QuantizerTrainer(dim=dim,
                                bytes_per_frame=bytes_per_frame,
-                               phase_one_iters=10000,
                                device=torch.device('cuda'))
 
     B = 600
@@ -70,13 +69,14 @@ def _test_quantizer_trainer_gaussian():
         trainer.step(generate_x())
 
     quantizer = trainer.get_quantizer() # of type Quantizer
+    x_mean = quantizer.get_data_mean()
 
     k = 30
     avg_rel_err = 0
     for i in range(k):
         x = generate_x()
         x_approx = quantizer.decode(quantizer.encode(x))
-        avg_rel_err += (1/k) * ((x-x_approx)**2).sum() / (x**2).sum()
+        avg_rel_err += (1/k) * ((x-x_approx)**2).sum() / ((x-x_mean)**2).sum()
 
     print(f"Done testing dim=256, avg relative approximation error = {avg_rel_err.item():.3f}, "
           f"compare with shannon distortion = {shannon_distortion:.5f}")
@@ -101,8 +101,7 @@ def _test_quantizer_trainer_double():
         nn.Linear(dim, dim),
     ).to(device)
     trainer = QuantizerTrainer(dim=512, bytes_per_frame=8,
-                               device=torch.device('cuda'),
-                               phase_one_iters=20000)
+                               device=torch.device('cuda'))
 
     B = 600
     def generate_x():
@@ -116,19 +115,20 @@ def _test_quantizer_trainer_double():
         trainer.step(generate_x())
 
     quantizer = trainer.get_quantizer() # of type Quantizer
+    x_mean = quantizer.get_data_mean()
 
     k = 30
     avg_rel_err = 0
     for i in range(k):
         x = generate_x()
         x_approx = quantizer.decode(quantizer.encode(x))
-        avg_rel_err += (1/k) * ((x-x_approx)**2).sum() / (x**2).sum()
+        avg_rel_err += (1/k) * ((x-x_approx)**2).sum() / ((x-x_mean)**2).sum()
 
     print("Done testing dim=512(=256,doubled); avg relative approximation error = ", avg_rel_err.item())
 
 
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
-    _test_quantizer_trainer_gaussian()
     _test_quantizer_trainer_double()
     _test_quantizer_trainer()
+    # _test_quantizer_trainer_gaussian()

@@ -13,6 +13,10 @@ def _test_train_from_file():
 
     device = torch.device('cuda')
 
+    # bytes_per_frame is the key thing you might want to tune: e.g. try 2 or 8
+    # or 16.
+    bytes_per_frame = 4
+
     B = 512  # Minibatch size, this is very arbitrary, it's close to what we used
              # when we tuned this method.
     def minibatch_generator(data: Tensor,
@@ -25,8 +29,9 @@ def _test_train_from_file():
             cur_offset += B
             yield data[start:end,:].to(device).to(dtype=torch.float)
 
-    trainer = QuantizerTrainer(dim=dim, bytes_per_frame=4,
-                               phase_one_iters=20000,
+
+    trainer = QuantizerTrainer(dim=dim,
+                               bytes_per_frame=bytes_per_frame,
                                device=device)
 
     for x in minibatch_generator(train, repeat=True):
@@ -34,6 +39,7 @@ def _test_train_from_file():
         if trainer.done():
             break
 
+    # You could also put quantizer.get_id() in the filename if you want.
     quantizer_fn = 'quantizer.pt'
 
     quantizer = trainer.get_quantizer()
@@ -43,15 +49,32 @@ def _test_train_from_file():
     quantizer2 = Quantizer(dim=dim, num_codebooks=4, codebook_size=256)
     quantizer2.load_state_dict(torch.load(quantizer_fn))
     quantizer2 = quantizer2.to(device)
+    x_mean = quantizer2.get_data_mean()
+
+    assert quantizer2.get_id() == quantizer.get_id()
+    print(f"Quantizer id is {quantizer.get_id()}")
 
     valid_count = 0
     tot_rel_err = 0
+
     for x in minibatch_generator(valid, repeat=False):
         x_approx = quantizer2.decode(quantizer2.encode(x))
-        tot_rel_err += ((x-x_approx)**2).sum() / (x**2).sum()
+        tot_rel_err += ((x-x_approx)**2).sum() / ((x-x_mean) ** 2).sum()
         valid_count += 1
+
     print(f"Validation average relative error: {tot_rel_err/valid_count:.5f}")
 
+    # shannon rate-distortion equation-- applicable to Gaussian noise only--
+    # says [rate = R, distortion = D]:
+    # R  =  1/2 log_2(sigma_x^2 / D)
+    # -> solving for D as a function of R,
+    # D = sigma_x^2 / (2 ** (2 * R)) = 1 / (2 ** (2 * R)) = 2 ** -(2 * R)
+    rate = bytes_per_frame * 8 / dim
+    shannon_distortion = 2 ** -(2 * rate)
+    print(f"For reference, Shannon distortion rate for is {shannon_distortion:.5f}.\n"
+          f"To the extent that the average relative error is lower than this,\n"
+          f"it means that the data is easier to compress than if it\n"
+          f"were a Gaussian with a spherical covariance matrix.")
 
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
