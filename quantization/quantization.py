@@ -1,6 +1,7 @@
 import h5py
 import math
 import numpy as np
+import time
 import torch
 import random
 import logging
@@ -177,8 +178,10 @@ class Quantizer(nn.Module):
         #  and on the iterations of the algorithm we either:
         #   - terminate by finding the best choice, if currently N == 1
         #   - combine pairs of choices, so that N := N//2, K := K ** 2, L *= 2
-        #   - reduce K to 16 by sorting and taking the 16 best possibilities
-        #     for each choice
+        #   - reduce K to K_cutoff by sorting and taking the K_cutoff best possibilities
+        #     for each choice.  K_cutoff is a power of 2 that starts at 8 or 16
+        #     and doubles every 2 iterations to keep the work per iteration
+        #     fairly constant.
 
 
         # cur_deltas represents the change in x_err from making each choice (while
@@ -200,14 +203,35 @@ class Quantizer(nn.Module):
         # Specifically, it is always supposed to equal the value of
         #  ((x_err + cur_deltas)**2).sum(dim=-1)
         # .. but we keep it around separately because it enables an optimization.
-        cur_sumsq = ((x_err + cur_deltas)**2).sum(dim=-1)
+        modified_err = x_err + cur_deltas # (B, N, K, dim)
+
+        # cur_sumsq: (B, N, K), equivalent to: ((x_err + cur_deltas)**2).sum(dim=-1)
+        # We really want batched vector-vector product her, which torch does not
+        # explicitly support, so we use a matrix multiplication with 1x1 output.
+        cur_sumsq = torch.matmul(modified_err.unsqueeze(-2),
+                                 modified_err.unsqueeze(-1)).squeeze(-1).squeeze(-1)
+
         assert cur_sumsq.shape == (B, N, K)
         # x_err_sumsq: (B, 1, 1), is the sum-squared of x_err; we'll need it in the loop.
         x_err_sumsq = (x_err**2).sum(dim=-1)
         gather_deltas = None # will be a lambda, see below.
 
-        K_cutoff = 16
+        K_cutoff_base = 8 if self.num_codebooks <= 16 else 16
+
+        def get_K_cutoff():
+            # Every time L increases by 4, we double K_cutoff.  This keeps the
+            # work per iteration roughly constant, as it's linear in 1/L
+            # and in K_cutoff**2.
+            l = L
+            K_cutoff = K_cutoff_base
+            while l >= 4:
+                l /= 4
+                K_cutoff *= 2
+            return min(K_cutoff, 128)
+
         while True:
+            K_cutoff = get_K_cutoff()
+
             if N == 1 and K == 1:
                 return cur_indexes.squeeze(2).squeeze(1) # (B, L) == (B, num_codebooks)
             elif K > K_cutoff or N == 1:
@@ -280,6 +304,7 @@ class Quantizer(nn.Module):
                 N, K, L = new_N, new_K, new_L
                 assert cur_indexes.shape == (B, N, K, L)
                 assert cur_sumsq.shape == (B, N, K)
+
 
 
     def _maybe_separate_indexes(self, indexes: Tensor) -> Tensor:
@@ -489,7 +514,9 @@ class QuantizerTrainer(object):
 
         self.quantizer = Quantizer(dim=dim, codebook_size=16,
                                    num_codebooks=bytes_per_frame*2).to(device)
+        self.start_time = time.time()
         self._init_optimizer()
+
 
 
     def _init_optimizer(self):
@@ -503,7 +530,12 @@ class QuantizerTrainer(object):
                                                          gamma=0.5)
 
     def done(self) -> bool:
-        return self.cur_iter > self.phase_one_iters + self.phase_two_iters
+        ans = self.cur_iter > self.phase_one_iters + self.phase_two_iters
+        if ans:
+            time = time.time() - self.start_time
+            logging.info(f"Elapsed time, training model of dim={self.quantizer.dim}, num_codebooks={self.quantizer.num_codebooks}, "
+                         "codebook_size={self.quantizer.codebook_size}, is: {time:.2f} seconds.")
+        return ans
 
     def step(self, x: torch.Tensor) -> None:
         """
