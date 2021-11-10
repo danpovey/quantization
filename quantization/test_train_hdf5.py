@@ -50,7 +50,7 @@ def _test_train_from_file():
         x_approx = quantizer2.decode(quantizer2.encode(x))
         tot_rel_err += ((x-x_approx)**2).sum() / (x**2).sum()
         valid_count += 1
-    print(f"Validation average relative error: {tot_rel_err/valid_count}")
+    print(f"Validation average relative error: {tot_rel_err/valid_count:.5f}")
 
 
 if __name__ == "__main__":
