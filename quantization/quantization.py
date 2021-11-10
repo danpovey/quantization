@@ -345,7 +345,13 @@ class Quantizer(nn.Module):
         """
         Return a Tensor of shape (self.num_codebooks, self.num_codebooks)
         with values >= 0, which are greater if a pair of codebooks more strongly
-        shares a subspace.
+        shares a subspace.  This is for diagnostic purposes.
+        These correlations are computed by:
+          - subtracting the mean value from each codebook
+          - creating an uncentered variance S_i for each codebook i
+          - computing, for each pair of codebooks i and j, c_{ij} = tr(S_i S_j)
+          - returning c_{ij} / sqrt(c_{ii} c_{ij}), which is a symmetric
+            matrix with values in [0,1]
         """
         centers = self.centers.reshape(self.num_codebooks,
                                        self.codebook_size,
