@@ -132,92 +132,14 @@ class Quantizer(nn.Module):
         # indexes: (B, self.num_codebooks)
         indexes = torch.argmax(logits, dim=-1)
         for i in range(refine_indexes_iters):
-            indexes = self._refine_indexes(x_reshaped, indexes, i)
+            indexes = self._refine_indexes(x_reshaped, indexes)
         assert indexes.ndim == 2
         return indexes.reshape(*x.shape[:-1], self.num_codebooks)
 
 
-    def _get_combinations(self, k: int, n: int, device: torch.device) -> Tensor:
-        """
-        Computes two matrix that represent k n-way choices.
-
-          k: the number of separate things we have to choose
-          n: the number of items we can choose (per choice)
-         device: the devicde that the tensors should be on.
-        Returns:
-           comb_indexes: a LongTensor of shape (n**k, k), containing elements in {0..n-1}.
-                     All rows are distinct.
-              comb_mat: a Tensor of shape (n**k, k*(n-1)), containing elements in {0,1}.
-                    Each row of comb_mat represents one row of comb_indexes, and represents
-                    the same set of choices.  It is obtained by creating a matrix of zeros of
-                    shape (n**k, k, n), and using scatter_ to put a 1 in the position
-                    corresponding to each choice in the corresponding row of `comb_indexes`,
-                    and then retaining only the last n-1 elements in dimension 2.
-        """
-        p = n ** k
-        arange = torch.arange(p, device=device)
-        powers = n ** torch.arange(k, device=device)
-        comb_indexes = (arange.unsqueeze(1) / powers.unsqueeze(0)).to(torch.long) % n
-
-        comb_one_hot = torch.zeros(p, k, n, device=device)
-        src = torch.ones(1, 1, 1, device=device).expand(p, k, n)
-        comb_one_hot.scatter_(src=src, dim=2, index=comb_indexes.unsqueeze(2))
-
-        comb_mat =  comb_one_hot[:,:,1:n].contiguous().reshape(p, k*(n-1))
-
-        return comb_indexes, comb_mat
-
-    def _compute_diff_sumsq(self,
-                            a: Tensor,
-                            b: Tensor) -> Tensor:
-        """
-        This is utility function that computes a particular expression in an optimized
-        way.
-
-        Args:
-           a: a Tensor of shape (i, 1, k, l)
-           b: a Tensor of shape (i, j, 1, l)
-        Returns:
-           a Tensor of shape (i, j, k), that is equal to ((a + b)**2).sum(dim=-1)
-        """
-        assert a.ndim == 4 and a.shape[1] == 1
-        assert b.ndim == 4 and b.shape[2] == 1
-
-        a2 = (a ** 2).sum(dim=-1)   # (i, 1, k)
-        b2 = (b ** 2).sum(dim=-1)   # (i, j, 1)
-        b_permuted = b.permute(0, 2, 3, 1) # (i, 1, l, j)
-        ab = torch.matmul(a, b_permuted)  # (i, 1, k, j)
-        ab = ab.squeeze(1).transpose(1, 2) # (i, j, j)
-        return a2 + b2 + 2 * ab
-
-    def _compute_diff_sumsq2(self,
-                            a: Tensor,
-                            b: Tensor) -> Tensor:
-        """
-        This is utility function that computes a particular expression in an optimized
-        way.
-
-        Args:
-           a: a Tensor of shape (1, j  k, l)
-           b: a Tensor of shape (i, j, 1, l)
-        Returns:
-           a Tensor of shape (i, j, k), that is equal to ((a + b)**2).sum(dim=-1)
-        """
-        assert a.ndim == 4 and a.shape[0] == 1
-        assert b.ndim == 4 and b.shape[2] == 1
-
-        a2 = (a ** 2).sum(dim=-1)   # (1, j, k)
-        b2 = (b ** 2).sum(dim=-1)   # (i, j, 1)
-        b_permuted = b.permute(2, 1, 3, 0) # (1, j, l, i)
-        ab = torch.matmul(a, b_permuted)  # (1, j, k, i)
-        ab = ab.squeeze(0).permute(2, 0, 1) # (i, j, k)
-        return a2 + b2 + 2 * ab
-
-
     def _refine_indexes(self,
                         x: Tensor,
-                        indexes: Tensor,
-                        i: int) -> Tensor:
+                        indexes: Tensor) -> Tensor:
         """
         Refine choices of indexes, minimizing sum-squared loss.  Note, this is not guaranteed
         not not increase the sum-squared loss, but works OK in practice.
@@ -243,136 +165,82 @@ class Quantizer(nn.Module):
         # centers_expanded has shape (B, self.num_codebooks, self.codebook_size, self.dim)
         centers_expanded = all_centers.expand(B, self.num_codebooks, self.codebook_size, self.dim)
 
-        # cur_centers: (B, self.num_codebooks, 1, self.dim)
-        cur_centers = torch.gather(centers_expanded, dim=2, index=indexes_expanded)
-        # x_err is of shape (B, 1, 1, self.dim), it is the current error of the approximation vs. x.
-        x_err = cur_centers.sum(dim=1, keepdim=True) - x.unsqueeze(1).unsqueeze(2)
+        # old_centers: (B, self.num_codebooks, 1, self.dim)
+        # centers with the "indexes" as passed-in.
+        old_centers = torch.gather(centers_expanded, dim=2, index=indexes_expanded)
+        # x_err is of shape (B, 1, 1, self.dim), it is the old value of (x_approx - x)
+        x_err = old_centers.sum(dim=1, keepdim=True) - x.unsqueeze(1).unsqueeze(2)
+
+        # The algorithm below is going to be iterative, where at each stage we
+        # have N K-way choices, with each choice corresponding to L codebook indexes.
+        #  Initially N == num_codebooks, K == codebook_size, L == 1,
+        #  and on the iterations of the algorithm we either:
+        #   - terminate by finding the best choice, if currently N == 1
+        #   - combine pairs of choices, so that N := N//2, K := K ** 2, L *= 2
+        #   - reduce K to 16 by sorting and taking the 16 best possibilities
+        #     for each choice
 
 
-        # Below, the 2 args of compute_diff_sumsq2 are:
-        #  a: of shape (1, self.num_codebooks, self.codebook_size, self.dim)
-        #  b: of shape (B, self.num_codebooks, 1, self.dim)
-        # The answer, equivalent to ((a+b)**2).sum(dim=-1), is
-        # of shape (B, self.num_codebooks, self.codebook_size).
-        modified_sumsq_errs = self._compute_diff_sumsq2(all_centers,
-                                                        x_err - cur_centers)
-
-        # The above is an optimization of:
-        # modified_errs = x_err - cur_centers + all_centers
-        # modified_sumsq_errs = ((modified_errs ** 2).sum(dim=-1))
-
-        # put -inf in modified_sumsq_errs in locations corresponding to the
-        # current "index", to make sure the current index stays in the top-n
-        # (will ensure prob at least gets no worse on any iter).
-        src = torch.full((1, 1, 1), float('-inf'), device=indexes.device).expand(B, self.num_codebooks,
-                                                                                 self.codebook_size)
-        modified_sumsq_errs.scatter_(dim=2, index=indexes.unsqueeze(-1), src=src)
-
-
-        if self.codebook_size <= 16 or (i >= 2 and i % 2 == 0):
-            N = 2 # for small codebook sizes, it's sufficient to search among the top-2.
-            codebooks_per_group = min(8, self.num_codebooks)
-        else:
-            N = 4
-            codebooks_per_group = min(4, self.num_codebooks)
-
-        assert self.num_codebooks % codebooks_per_group == 0
-
-
-        # `sorted_indexes`, of shape (B, num_codebooks, codebook_size), contains the
-        # indexes from best to worst for each codebook.
-        _, sorted_indexes = modified_sumsq_errs.sort(dim=2)
-        # topn_indexes: (B, num_codebooks, N); contains
-        # n-best codebook indexes for each codebook.
-        topn_indexes = sorted_indexes[:,:,:N]
-
-
-        # topn1_indexes_expanded: (B, self.num_codebooks, N-1, self.dim),
-        # from this point we exclude the top-1 index because it's the same as the current
-        # index and will give us a zero "delta", so we can get a small speedup by
-        # excluding it from our matrix multiplication.
+        # cur_deltas represents the change in x_err from making each choice (while
+        # leaving all the other choices un-made by just keeping the passed-in/old
+        # indexes).
+        #  cur_deltas: (B, N, K, dim),
+        N = self.num_codebooks
+        K = self.codebook_size
+        L = 1  # L is the number of codebooks covered by each choice.
+        cur_deltas = all_centers - old_centers  # (B, N, K, dim)
         dim = self.dim
-        topn1_indexes_expanded = (
-            topn_indexes[:,:,1:].unsqueeze(-1).expand(B, self.num_codebooks,
-                                                      N - 1, dim))
-
-        # proposed_new_centers: (B, self.num_codebooks, N-1, dim)
-        # containing the centers corresponding to 'proposed_indexes'
-        proposed_new_centers = torch.gather(centers_expanded, dim=2,
-                                            index=topn1_indexes_expanded)
-
-        # proposed_deltas, of shape (B, num_codebooks, N-1, dim), contains the
-        # change in the prediction if we were to accept this, among the top-n indexes
-        # for this codebook.
-        proposed_deltas = proposed_new_centers - cur_centers
-
-        # proposed_deltas: (B, dim, num_codebooks, N-1)
-        proposed_deltas = proposed_deltas.permute(0, 3, 1, 2)
-
-        x_err_squeezed = x_err.squeeze(1) # (B, 1, dim)
-
-        # We have to enumerate the number below, so make sure it is no greater
-        # than 256.
-        num_combinations = N ** codebooks_per_group
-        assert num_combinations <= 256
-
-        # comb_indexes: (num_combinations, codebooks_per_group), contains elements in {0..N-1}
-        # comb_mat: (num_combinations, codebooks_per_group * (N-1)), contains elements in {0,1}
-        comb_indexes, comb_mat = self._get_combinations(codebooks_per_group,
-                                                        N, indexes.device)
+        assert cur_deltas.shape == (B, N, K, dim)
+        # cur_indexes is the codebook indexes corresponding to 'cur_deltas'.
+        cur_indexes = torch.arange(K, device=x.device).reshape(1, 1, K, 1).expand(B, N, K, L)
 
 
-        # If there are multiple blocks, we randomize the order (we don't always
-        # start from the lowest-numbered block).
-        num_blocks = self.num_codebooks // codebooks_per_group
-        rand_offset = codebooks_per_group * random.randint(0, num_blocks - 1)
+        cutoff = 8
+        while True:
+            if N == 1 and K == 1:
+                return cur_indexes.squeeze(2).squeeze(1) # (B, L) == (B, num_codebooks)
+            elif K > 8 or N == 1:
+                # Sort the options for each choice, and reduce K.
+                all_x_errs = x_err + cur_deltas  # (B, N, K, dim)
+                all_x_errs_sumsq = (all_x_errs**2).sum(dim=-1) # (B, N, K)
+                # this_indexes: (B, N, K); elements in {0..K-1}.  These
+                # are sorted from best to worst.
+                _, this_indexes = torch.sort(all_x_errs_sumsq, dim=2)
 
-        for _begin_c in range(0, self.num_codebooks, codebooks_per_group):
-            # randomize the first one to optimize.  Otherwise the first codebooks tend to
-            # "dominate" (get the most useful variation).
-            begin_c = (_begin_c + rand_offset) % self.num_codebooks
-            end_c = begin_c + codebooks_per_group
+                this_indexes = this_indexes.unsqueeze(-1)
 
-            this_proposed_deltas = proposed_deltas[:,:,begin_c:end_c,:].reshape(
-                B, dim, codebooks_per_group*(N-1))
+                # cur_indexes is (B, N, K, dim), but sorted from worst to best.
+                cur_indexes = torch.gather(input=cur_indexes, dim=2,
+                                           index=this_indexes.expand(B, N, K, L))
+                # also sort cur_deltas in the same way
+                cur_deltas = torch.gather(input=cur_deltas, dim=2,
+                                          index=this_indexes.expand(B, N, K, dim))
 
-            # all_possible_deltas: (B, num_combinations, dim)
-            all_possible_deltas = torch.matmul(this_proposed_deltas,
-                                               comb_mat.t()).transpose(1,2)
+                K = 1 if N == 1 else 8
+                cur_indexes = cur_indexes[:,:,:K,:]
+                cur_deltas = cur_deltas[:,:,:K,:]
+            else:
+                # Combine pairs of choices.  We know that N > 1.
+                even_deltas = cur_deltas[:,0::2,:,:]
+                odd_deltas = cur_deltas[:,1::2,:,:]
+                even_indexes = cur_indexes[:,0::2,:,:]
+                odd_indexes = cur_indexes[:,1::2,:,:]
 
-            assert all_possible_deltas.shape == (B, num_combinations, dim)
-            all_possible_x_errs = x_err_squeezed + all_possible_deltas  # (B, num_combinations, dim)
-            all_possible_x_errs_sumsq = (all_possible_x_errs**2).sum(dim=-1) # (B, num_combinations)
-            # chosen_combinations is of shape: (B,); contains elements in {0..num_combinations-1}
-            chosen_combinations = (-all_possible_x_errs_sumsq).argmax(dim=1)
-            assert chosen_combinations.shape == (B,)
+                new_N = N // 2
+                new_K = K ** 2
+                new_L = L * 2
 
-            # selected_indexes will be of shape (B, codebooks_per_group), with
-            # elements in 0..N-1.
-            selected_indexes = torch.index_select(comb_indexes, dim=0,
-                                                  index=chosen_combinations)
-            # real_indexes: (B,codebooks_per_group), contains indexes in {0..codebook_size-1}
-            real_indexes = torch.gather(topn_indexes[:,begin_c:end_c,:], #(B,codebooks_per_group,N)
-                                        dim=2,
-                                        index=selected_indexes.unsqueeze(-1)).squeeze(1)
+                even_deltas = even_deltas.unsqueeze(3) # (B, new_N, K, 1, dim)
+                odd_deltas = odd_deltas.unsqueeze(2) # (B, new_N, 1, K, dim)
 
-            # Replace selected elements of `indexes` with elements of `real_indexes`
-            indexes[:,begin_c:end_c] = real_indexes.squeeze(-1)
+                cur_deltas = (even_deltas + odd_deltas).reshape(B, new_N, new_K, dim)
+                even_indexes = even_indexes.unsqueeze(3).expand(B, new_N, K, K, L).reshape(B, new_N, new_K, L)
+                odd_indexes = odd_indexes.unsqueeze(2).expand(B, new_N, K, K, L).reshape(B, new_N, new_K, L)
+                cur_indexes = torch.cat((even_indexes, odd_indexes), dim=3)
 
-            if begin_c + N < self.num_codebooks:
-                # not the last iter.. must keep x_err_squeezed updated.
-
-                # chosen_combinations_reshaped: (B, 1, dim), contains elements in {0..num_combinations-1}
-                chosen_combinations_reshaped = chosen_combinations.unsqueeze(1).unsqueeze(2).expand(B, 1, dim)
-                # selected_deltas contains the changes in x_approx that we selected.
-                # Its shape is (B, 1, dim).
-                selected_deltas = torch.gather(all_possible_deltas, dim=1,
-                                               index=chosen_combinations_reshaped)
-                x_err_squeezed += selected_deltas
-
-
-        assert indexes.ndim == 2
-        return indexes
+                N, K, L = new_N, new_K, new_L
+                assert cur_deltas.shape == (B, N, K, dim)
+                assert cur_indexes.shape == (B, N, K, L)
 
 
     def _maybe_separate_indexes(self, indexes: Tensor) -> Tensor:
