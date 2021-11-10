@@ -194,53 +194,92 @@ class Quantizer(nn.Module):
         # cur_indexes is the codebook indexes corresponding to 'cur_deltas'.
         cur_indexes = torch.arange(K, device=x.device).reshape(1, 1, K, 1).expand(B, N, K, L)
 
+        # cur_sumsq: (B, N, K), is the sum-squared error if we were to
+        # make the n'th choice without making any of the other N-1 choices, i.e.
+        # if we were to leave the other choices at the value we had at input.
+        # Specifically, it is always supposed to equal the value of
+        #  ((x_err + cur_deltas)**2).sum(dim=-1)
+        # .. but we keep it around separately because it enables an optimization.
+        cur_sumsq = ((x_err + cur_deltas)**2).sum(dim=-1)
+        assert cur_sumsq.shape == (B, N, K)
+        # x_err_sumsq: (B, 1, 1), is the sum-squared of x_err; we'll need it in the loop.
+        x_err_sumsq = (x_err**2).sum(dim=-1)
+        gather_deltas = None # will be a lambda, see below.
 
-        cutoff = 8
+        K_cutoff = 16
         while True:
             if N == 1 and K == 1:
                 return cur_indexes.squeeze(2).squeeze(1) # (B, L) == (B, num_codebooks)
-            elif K > 8 or N == 1:
+            elif K > K_cutoff or N == 1:
                 # Sort the options for each choice, and reduce K.
-                all_x_errs = x_err + cur_deltas  # (B, N, K, dim)
-                all_x_errs_sumsq = (all_x_errs**2).sum(dim=-1) # (B, N, K)
                 # this_indexes: (B, N, K); elements in {0..K-1}.  These
-                # are sorted from best to worst.
-                _, this_indexes = torch.sort(all_x_errs_sumsq, dim=2)
+                # are sorted from best (lowest) to worst.
+                _, this_indexes = torch.sort(cur_sumsq, dim=2)
+
+
+                new_K = 1 if N == 1 else K_cutoff
+                this_indexes = this_indexes[:,:,:new_K]
+                cur_sumsq = torch.gather(input=cur_sumsq, dim=2,
+                                          index=this_indexes)
 
                 this_indexes = this_indexes.unsqueeze(-1)
 
-                # cur_indexes is (B, N, K, dim), but sorted from worst to best.
+                # cur_indexes is (B, N, new_K, dim), but sorted from worst to best.
                 cur_indexes = torch.gather(input=cur_indexes, dim=2,
-                                           index=this_indexes.expand(B, N, K, L))
-                # also sort cur_deltas in the same way
-                cur_deltas = torch.gather(input=cur_deltas, dim=2,
-                                          index=this_indexes.expand(B, N, K, dim))
+                                           index=this_indexes.expand(B, N, new_K, L))
 
-                K = 1 if N == 1 else 8
-                cur_indexes = cur_indexes[:,:,:K,:]
-                cur_deltas = cur_deltas[:,:,:K,:]
+                if cur_deltas is not None:
+                    # also sort cur_deltas in the same way
+                    cur_deltas = torch.gather(input=cur_deltas, dim=2,
+                                              index=this_indexes.expand(B, N, new_K, dim))
+                else:
+                    cur_deltas = gather_deltas(this_indexes)
+                K = new_K
             else:
                 # Combine pairs of choices.  We know that N > 1.
                 even_deltas = cur_deltas[:,0::2,:,:]
                 odd_deltas = cur_deltas[:,1::2,:,:]
                 even_indexes = cur_indexes[:,0::2,:,:]
                 odd_indexes = cur_indexes[:,1::2,:,:]
+                even_sumsq = cur_sumsq[:,0::2,:]
+                odd_sumsq = cur_sumsq[:,1::2,:]
 
                 new_N = N // 2
                 new_K = K ** 2
                 new_L = L * 2
 
-                even_deltas = even_deltas.unsqueeze(3) # (B, new_N, K, 1, dim)
-                odd_deltas = odd_deltas.unsqueeze(2) # (B, new_N, 1, K, dim)
-
-                cur_deltas = (even_deltas + odd_deltas).reshape(B, new_N, new_K, dim)
                 even_indexes = even_indexes.unsqueeze(3).expand(B, new_N, K, K, L).reshape(B, new_N, new_K, L)
                 odd_indexes = odd_indexes.unsqueeze(2).expand(B, new_N, K, K, L).reshape(B, new_N, new_K, L)
                 cur_indexes = torch.cat((even_indexes, odd_indexes), dim=3)
 
+                even_sumsq = even_sumsq.unsqueeze(3) # (B, new_N, K, 1)
+                odd_sumsq = odd_sumsq.unsqueeze(2) # (B, new_N, 1, K)
+                # cur_sumsq below is a partial version, we have to add another term.
+                # The new version of cur_sumsq that we want can be expressed as:
+                #   ((a + b + c)**2).sum(dim=-1),
+                # where a = x_err, b == even_deltas, c == odd_deltas.  Ignoring the summation, we
+                # can write this as:
+                #  a^2 + b^2 + c^2 + 2ab + 2ac + 2bc.
+                # We can rearrange this as:
+                # (a^2 + b^2 + 2ab) + (a^2 + c^2 + 2ac) - a^2 + 2bc,
+                # which is the same as
+                # even_sumsq + odd_sumsq - x_err_sumsq + 2bc,
+                # where 2bc is a certain matrix product of odd_deltas and even_deltas.
+                cur_sumsq = ((even_sumsq + odd_sumsq).reshape(B, new_N, new_K) - x_err_sumsq +
+                             2 * torch.matmul(even_deltas,
+                                              odd_deltas.transpose(2, 3)).reshape(B, new_N, new_K))
+
+                saved_K = K
+                gather_deltas = lambda this_indexes: (torch.gather(input=even_deltas, dim=2,
+                                                                   index=(this_indexes//saved_K).expand(*this_indexes.shape[:-1], dim)) +
+                                                      torch.gather(input=odd_deltas, dim=2,
+                                                                   index=(this_indexes%saved_K).expand(*this_indexes.shape[:-1], dim)))
+
+                cur_deltas = None # Unset it, it is now invalid, but we'll reconstruct it using gather_deltas.
+
                 N, K, L = new_N, new_K, new_L
-                assert cur_deltas.shape == (B, N, K, dim)
                 assert cur_indexes.shape == (B, N, K, L)
+                assert cur_sumsq.shape == (B, N, K)
 
 
     def _maybe_separate_indexes(self, indexes: Tensor) -> Tensor:
