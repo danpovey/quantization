@@ -12,6 +12,9 @@ from typing import Tuple
 
 
 class Quantizer(nn.Module):
+    # what this is implementing appears to be referred to as direct-sum codebooks in the scientific literature.
+    # see also residual vector quantization, or multistage VQ, although this method jointly optimizes
+    # the codebook entries so there is no order.
     def __init__(self, dim: int,
                  codebook_size: int,
                  num_codebooks: int):
@@ -222,8 +225,7 @@ class Quantizer(nn.Module):
             # Every time L increases by 4, we double K_cutoff.  This keeps the
             # work per iteration roughly constant, as it's linear in 1/L
             # and in K_cutoff**2.
-            l = L
-            K_cutoff = K_cutoff_base
+            K_cutoff, l = K_cutoff_base, L
             while l >= 4:
                 l /= 4
                 K_cutoff *= 2
@@ -532,9 +534,9 @@ class QuantizerTrainer(object):
     def done(self) -> bool:
         ans = self.cur_iter > self.phase_one_iters + self.phase_two_iters
         if ans:
-            time = time.time() - self.start_time
+            elapsed_time = time.time() - self.start_time
             logging.info(f"Elapsed time, training model of dim={self.quantizer.dim}, num_codebooks={self.quantizer.num_codebooks}, "
-                         "codebook_size={self.quantizer.codebook_size}, is: {time:.2f} seconds.")
+                         f"codebook_size={self.quantizer.codebook_size}, is: {elapsed_time:.2f} seconds.")
         return ans
 
     def step(self, x: torch.Tensor) -> None:
@@ -569,7 +571,7 @@ class QuantizerTrainer(object):
                          f"logits_entropy_loss={logits_entropy_loss.item():.3f}, "
                          f"index_entropy_loss={index_entropy_loss.item():.3f}")
 
-        if self.cur_iter % 2000 == 0:
+        if self.cur_iter % 2000 == 0 and self.cur_iter > 0:
             correlations = self.quantizer.compute_codebook_correlations()
             logging.info(f"correlations = {correlations}")
 

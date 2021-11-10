@@ -21,7 +21,7 @@ def _test_quantizer_trainer():
         nn.LayerNorm(dim),
         nn.Linear(dim, dim),
     ).to(device)
-    trainer = QuantizerTrainer(dim=256, bytes_per_frame=4,
+    trainer = QuantizerTrainer(dim=dim, bytes_per_frame=4,
                                phase_one_iters=10000,
                                device=torch.device('cuda'))
 
@@ -44,6 +44,43 @@ def _test_quantizer_trainer():
         avg_rel_err += (1/k) * ((x-x_approx)**2).sum() / (x**2).sum()
 
     print("Done testing dim=256, avg relative approximation error = ", avg_rel_err.item())
+
+
+def _test_quantizer_trainer_gaussian():
+    dim = 256
+    device = torch.device('cuda')
+    bytes_per_frame = 8
+    rate = bytes_per_frame * 8 / dim
+    # shannon rate-distortion equation says [rate = R, distortion = D]:
+    # R  =  1/2 log_2(sigma_x^2 / D)
+    # -> solving for D as a function of R,
+    # D = sigma_x^2 / (2 ** (2 * R)) = 1 / (2 ** (2 * R)) = 2 ** -(2 * R)
+    shannon_distortion = 2 ** -(2 * rate)
+    print(f"Testing dim={dim}, gaussian input, bytes_per_frame={bytes_per_frame}, shannon_distortion={shannon_distortion:.5f}")
+    trainer = QuantizerTrainer(dim=dim,
+                               bytes_per_frame=bytes_per_frame,
+                               phase_one_iters=10000,
+                               device=torch.device('cuda'))
+
+    B = 600
+    def generate_x():
+        return torch.randn(B, dim, device=device)
+
+    while not trainer.done():
+        trainer.step(generate_x())
+
+    quantizer = trainer.get_quantizer() # of type Quantizer
+
+    k = 30
+    avg_rel_err = 0
+    for i in range(k):
+        x = generate_x()
+        x_approx = quantizer.decode(quantizer.encode(x))
+        avg_rel_err += (1/k) * ((x-x_approx)**2).sum() / (x**2).sum()
+
+    print(f"Done testing dim=256, avg relative approximation error = {avg_rel_err.item():.3f}, "
+          f"compare with shannon distortion = {shannon_distortion:.5f}")
+
 
 def _test_quantizer_trainer_double():
     # doubled means, 2 copies of the same distribution; we do this
@@ -92,5 +129,6 @@ def _test_quantizer_trainer_double():
 
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
+    _test_quantizer_trainer_gaussian()
     _test_quantizer_trainer_double()
     _test_quantizer_trainer()
