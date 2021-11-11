@@ -28,10 +28,10 @@ python3 setup.py install
 
 ```python
 import torch
-import quantizer
+import quantization
 
-trainer = quantizer.QuantizerTrainer(dim=256, bytes_per_frame=4,
-                                     device=torch.device('cuda'))
+trainer = quantization.QuantizerTrainer(dim=256, bytes_per_frame=4,
+                                        device=torch.device('cuda'))
 while not trainer.done():
    # let x be some tensor of shape (*, dim), that you will train on
    # (should not be the same on each minibatch)
@@ -42,3 +42,6 @@ quantizer = trainer.get_quantizer()
 encoded = quantizer.encode(x)  # (*, 4), dtype=uint8
 x_approx = quantizer.decode(quantizer.encode(x))
 ```
+
+To avoid versioning issues and so on, it may be easier to just include quantization.py
+in your repository directly (and add its requirements to your requirements.txt).

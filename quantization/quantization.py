@@ -369,7 +369,7 @@ class Quantizer(nn.Module):
         x_err_sumsq = (x_err**2).sum(dim=-1)
         gather_deltas = None # will be a lambda, see below.
 
-        K_cutoff_base = 8 if self.num_codebooks <= 16 else 16
+        K_cutoff_base = 8 if self.codebook_size <= 16 else 16
 
         def get_K_cutoff():
             # Every time L increases by 4, we double K_cutoff.  This keeps the
