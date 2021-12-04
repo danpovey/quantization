@@ -59,6 +59,8 @@ class JointCodebookPredictor(nn.Module):
 
         print("linear_self_mask = ", self.linear_self_mask) # TEMP
 
+
+        self.norm = nn.LayerNorm(num_codebooks * codebook_size)
         self.linear2 = nn.Linear(num_codebooks * hidden_dim,
                                  num_codebooks * codebook_size)
 
@@ -112,8 +114,12 @@ class JointCodebookPredictor(nn.Module):
                                    tot_codebook_dim - self.codebook_size)
         hidden_part += self_predictor
 
-        hidden = nn.functional.relu(hidden)
+        hidden = self.norm(nn.functional.relu(hidden))
+
         logprobs = self.linear2(hidden)
+
+
+
         logprobs = logprobs.reshape(*common_shape, self.num_codebooks, self.codebook_size)
         logprobs = logprobs.log_softmax(dim=-1)
         logprobs = logprobs.reshape(*common_shape, self.num_codebooks * self.codebook_size)
