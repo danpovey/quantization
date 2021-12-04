@@ -113,9 +113,11 @@ def _test_joint_predictor():
                                                 gamma=0.5)
 
     count = 0
+
+    x_noise_level = 0.0
     for x in minibatch_generator(train, repeat=True):
         x = x.to(device)
-        encoding = quantizer.encode(x)
+        encoding = quantizer.encode(x + x_noise_level * torch.randn_like(x))
         tot_logprob, tot_count = predictor(x, encoding) # should be easy to predict encoding from x.
 
         loss = -(tot_logprob / tot_count)

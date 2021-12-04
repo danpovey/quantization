@@ -33,14 +33,14 @@ class JointCodebookPredictor(nn.Module):
                  predictor_dim: int,
                  num_codebooks: int,
                  codebook_size: int = 256,
-                 hidden_dim: int = 256):
+                 hidden_dim: int = 384):
         super(JointCodebookPredictor, self).__init__()
 
         self.num_codebooks = num_codebooks
         self.codebook_size = codebook_size
+        self.hidden_dim = hidden_dim
 
         self.linear1 = nn.Linear(predictor_dim, num_codebooks * hidden_dim)
-
 
         linear_self_out_dim = (num_codebooks - 1) * hidden_dim
         linear_self_in_dim = (num_codebooks - 1) * codebook_size
@@ -59,10 +59,9 @@ class JointCodebookPredictor(nn.Module):
 
         print("linear_self_mask = ", self.linear_self_mask) # TEMP
 
-
-        self.norm = nn.LayerNorm(num_codebooks * codebook_size)
-        self.linear2 = nn.Linear(num_codebooks * hidden_dim,
-                                 num_codebooks * codebook_size)
+        self.norm = nn.BatchNorm1d(num_codebooks * hidden_dim)
+        self.linear2 = nn.Parameter(torch.randn(num_codebooks, codebook_size, hidden_dim) * (hidden_dim ** -0.5))
+        self.bias2 = nn.Parameter(torch.zeros(num_codebooks, codebook_size))
 
 
     def forward(self,
@@ -95,13 +94,17 @@ class JointCodebookPredictor(nn.Module):
         tot_codebook_dim = self.num_codebooks * self.codebook_size
 
         common_shape = list(predictor.shape[:-1])
-        codebook_one_hot = torch.zeros(*common_shape, tot_codebook_dim,
+        codebook_one_hot = torch.zeros(*common_shape, self.num_codebooks,
+                                       self.codebook_size,
                                        device=predictor.device)
 
-        codebook_mask = (codebook_indexes >= 0)
-        codebook_indexes_floor = torch.clamp(codebook_indexes, min=0)
+        codebook_mask = (codebook_indexes >= 0).unsqueeze(-1) # (*, num_codebooks, 1)
+        codebook_indexes_floor = torch.clamp(codebook_indexes, min=0).unsqueeze(-1) # (*, num_codebooks, 1)
         codebook_one_hot.scatter_(dim=-1, index=codebook_indexes_floor,
                                   src=codebook_mask.to(torch.float32))
+        codebook_one_hot = codebook_one_hot.reshape(*common_shape,
+                                                    tot_codebook_dim) # (*, tot_codebook_dim)
+        #print("codebook_one_hot = ", codebook_one_hot.sum(dim=tuple(range(codebook_one_hot.ndim-1))))
 
         codebook_one_hot_part = torch.narrow(codebook_one_hot, -1, 0,
                                              tot_codebook_dim - self.codebook_size)
@@ -110,21 +113,27 @@ class JointCodebookPredictor(nn.Module):
         hidden = self.linear1(predictor)
         # Before the hidden layer, add the 'self_predictor' term to all but the 1st
         # block of "hidden".
-        hidden_part = torch.narrow(hidden, -1, self.codebook_size,
-                                   tot_codebook_dim - self.codebook_size)
+        hidden_part = torch.narrow(hidden, -1, self.hidden_dim,
+                                   self.hidden_dim * (self.num_codebooks - 1))
+
+        # HERE: you can comment out the next line to see the effect of disabling the regression on
+        # previous codebooks.
         hidden_part += self_predictor
 
-        hidden = self.norm(nn.functional.relu(hidden))
+        hidden = nn.functional.relu(hidden)
+        hidden = hidden.reshape(-1, self.hidden_dim * self.num_codebooks)
+        hidden = self.norm(hidden)
+        hidden = hidden.reshape(*common_shape, self.num_codebooks, self.hidden_dim)  # (*, num_codebooks, hidden_dim)
 
-        logprobs = self.linear2(hidden)
+        logprobs = torch.matmul(hidden.unsqueeze(-2), self.linear2.transpose(1, 2)).squeeze(-2) + self.bias2
 
-
-
-        logprobs = logprobs.reshape(*common_shape, self.num_codebooks, self.codebook_size)
+        # logprobs: (*, num_codebooks, codebook_size)
         logprobs = logprobs.log_softmax(dim=-1)
         logprobs = logprobs.reshape(*common_shape, self.num_codebooks * self.codebook_size)
 
         tot_logprob = torch.dot(logprobs.reshape(-1), codebook_one_hot.reshape(-1))
-        tot_count = codebook_mask.sum()
+        # the select() part is to select only the mask for one of the codebooks (they should
+        # all be the same), as we want the total number of frames.
+        tot_count = codebook_mask.select(dim=-2, index=0).sum()
 
         return (tot_logprob, tot_count)
