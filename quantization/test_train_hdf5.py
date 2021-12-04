@@ -103,7 +103,8 @@ def _test_joint_predictor():
             yield data[start:end,:].to(device).to(dtype=torch.float)
 
     predictor = JointCodebookPredictor(predictor_dim=dim,
-                                       num_codebooks=bytes_per_frame).to(device)
+                                       num_codebooks=bytes_per_frame,
+                                       self_prediction=True).to(device)
 
     optim = torch.optim.Adam(
         predictor.parameters(), lr=0.0001, betas=(0.9, 0.98), eps=1e-9, weight_decay=1.0e-06

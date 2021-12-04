@@ -28,11 +28,17 @@ class JointCodebookPredictor(nn.Module):
                will likely be the same as the bytes_per_frame given to the
                QuantizerTrainer that you used to train the Quantizer you
                are predicting.
+        codebook_size: number of entries per codebook (often 256)
+        self_prediction: you can set this to false to enable prediction of
+              codebooks by earlier-numbered codebooks
+        hidden_dim: the hidden dimension per codebook (we use a 1-hidden-layer
+              network, with a ReLU and then batchnorm).
     """
     def __init__(self,
                  predictor_dim: int,
                  num_codebooks: int,
                  codebook_size: int = 256,
+                 self_prediction: bool = True,
                  hidden_dim: int = 384):
         super(JointCodebookPredictor, self).__init__()
 
@@ -42,22 +48,26 @@ class JointCodebookPredictor(nn.Module):
 
         self.linear1 = nn.Linear(predictor_dim, num_codebooks * hidden_dim)
 
-        linear_self_out_dim = (num_codebooks - 1) * hidden_dim
-        linear_self_in_dim = (num_codebooks - 1) * codebook_size
-        self.linear_self = nn.Parameter(torch.randn(linear_self_out_dim,
-                                                    linear_self_in_dim) * (linear_self_in_dim ** -0.5))
 
-        # num_codebooks == 3 and hidden_dim == 2 and codebook_size == 2,
-        # the expression below has the value:
-        #tensor([[ True,  True, False, False],
-        #        [ True,  True, False, False],
-        #        [ True,  True,  True,  True],
-        #        [ True,  True,  True,  True]])
-        self.register_buffer('linear_self_mask',
-                             ((torch.arange(linear_self_out_dim) // hidden_dim).unsqueeze(1) >=
-                              (torch.arange(linear_self_in_dim) // codebook_size).unsqueeze(0)))
+        if self_prediction:
+            linear_self_out_dim = (num_codebooks - 1) * hidden_dim
+            linear_self_in_dim = (num_codebooks - 1) * codebook_size
+            self.linear_self = nn.Parameter(torch.randn(linear_self_out_dim,
+                                                        linear_self_in_dim) * (linear_self_in_dim ** -0.5))
 
-        print("linear_self_mask = ", self.linear_self_mask) # TEMP
+            # num_codebooks == 3 and hidden_dim == 2 and codebook_size == 2,
+            # the expression below has the value:
+            #tensor([[ True,  True, False, False],
+            #        [ True,  True, False, False],
+            #        [ True,  True,  True,  True],
+            #        [ True,  True,  True,  True]])
+            self.register_buffer('linear_self_mask',
+                                 ((torch.arange(linear_self_out_dim) // hidden_dim).unsqueeze(1) >=
+                                  (torch.arange(linear_self_in_dim) // codebook_size).unsqueeze(0)))
+        else:
+            self.register_parameter('linear_self', None)
+            self.register_buffer('linear_self_mask', None)
+
 
         self.norm = nn.BatchNorm1d(num_codebooks * hidden_dim)
         self.linear2 = nn.Parameter(torch.randn(num_codebooks, codebook_size, hidden_dim) * (hidden_dim ** -0.5))
@@ -104,21 +114,20 @@ class JointCodebookPredictor(nn.Module):
                                   src=codebook_mask.to(torch.float32))
         codebook_one_hot = codebook_one_hot.reshape(*common_shape,
                                                     tot_codebook_dim) # (*, tot_codebook_dim)
-        #print("codebook_one_hot = ", codebook_one_hot.sum(dim=tuple(range(codebook_one_hot.ndim-1))))
 
-        codebook_one_hot_part = torch.narrow(codebook_one_hot, -1, 0,
-                                             tot_codebook_dim - self.codebook_size)
-        self_predictor = torch.matmul(codebook_one_hot_part,
-                                      (self.linear_self * self.linear_self_mask).transpose(0, 1))
         hidden = self.linear1(predictor)
-        # Before the hidden layer, add the 'self_predictor' term to all but the 1st
-        # block of "hidden".
-        hidden_part = torch.narrow(hidden, -1, self.hidden_dim,
-                                   self.hidden_dim * (self.num_codebooks - 1))
+        if self.linear_self is not None:
+            codebook_one_hot_part = torch.narrow(codebook_one_hot, -1, 0,
+                                                 tot_codebook_dim - self.codebook_size)
+            self_predictor = torch.matmul(codebook_one_hot_part,
+                                          (self.linear_self * self.linear_self_mask).transpose(0, 1))
 
-        # HERE: you can comment out the next line to see the effect of disabling the regression on
-        # previous codebooks.
-        hidden_part += self_predictor
+            # add the 'self_predictor' term to all but the 1st
+            # block of "hidden".
+            hidden_part = torch.narrow(hidden, -1, self.hidden_dim,
+                                       self.hidden_dim * (self.num_codebooks - 1))
+
+            hidden_part += self_predictor
 
         hidden = nn.functional.relu(hidden)
         hidden = hidden.reshape(-1, self.hidden_dim * self.num_codebooks)
