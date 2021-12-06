@@ -126,6 +126,7 @@ def _test_joint_predictor():
             logging.info(f"Iter={count}, loss = {loss.item():.3f}")
         loss.backward()
         optim.step()
+        optim.zero_grad()
         scheduler.step()
         count += 1
         if count > 10000:
@@ -134,5 +135,5 @@ def _test_joint_predictor():
 
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
-    #_test_train_from_file()
+    _test_train_from_file()
     _test_joint_predictor()
