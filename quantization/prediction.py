@@ -5,7 +5,8 @@ from typing import Tuple
 
 
 
-class JointCodebookPredictor(nn.Module):
+
+class JointCodebookLoss(nn.Module):
     """
     This module predicts a group of codebook indexes from a vector.  The idea is that
     you have a number of codebooks (probably jointly trained), from class Quantizer,
@@ -24,6 +25,9 @@ class JointCodebookPredictor(nn.Module):
     Args:
         predictor_dim: the number of features that we use to predict the codebook
                indexes, e.g. 2048 (will depend on your model).
+        hidden_dim:  a hidden dimension in the model; should be more than
+                codebook_size, but may be less or more than predictor_dim.
+
         num_codebooks: the number of codebooks that you are predicting;
                will likely be the same as the bytes_per_frame given to the
                QuantizerTrainer that you used to train the Quantizer you
@@ -35,44 +39,37 @@ class JointCodebookPredictor(nn.Module):
               network, with a ReLU and then batchnorm).
     """
     def __init__(self,
-                 predictor_dim: int,
+                 predictor_channels: int,
                  num_codebooks: int,
+                 hidden_channels: int = 512,
                  codebook_size: int = 256,
-                 self_prediction: bool = True,
-                 hidden_dim: int = 384):
-        super(JointCodebookPredictor, self).__init__()
+                 reduction: str = 'sum',
+                 ignore_index: int = -100):
+        super(JointCodebookLoss, self).__init__()
 
+        assert num_codebooks > 1 # we may later handle this specially.
         self.num_codebooks = num_codebooks
         self.codebook_size = codebook_size
-        self.hidden_dim = hidden_dim
+        self.hidden_channels = hidden_channels
 
-        self.linear1 = nn.Linear(predictor_dim, num_codebooks * hidden_dim)
+        self.linear1 = nn.Linear(predictor_channels, hidden_channels)
 
+        # codebook_embedding is used to predict each codebook from previous
+        # codebooks, so it's a joint, not independent, model.  we'll multiply
+        # this by hidden_channels ** 0.5 when we use it; this keeps the magnitude
+        # small allows it to train fast enough (relatively speaking).
+        self.codebook_embedding = nn.Embedding((num_codebooks - 1) * codebook_size,
+                                               hidden_channels,
+                                               _weight=torch.randn((num_codebooks - 1) * codebook_size,
+                                                                   hidden_channels) * (hidden_channels ** -0.5))
+        self.nonlin = nn.ReLU(inplace=True)
 
-        if self_prediction:
-            linear_self_out_dim = (num_codebooks - 1) * hidden_dim
-            linear_self_in_dim = (num_codebooks - 1) * codebook_size
-            self.linear_self = nn.Parameter(torch.randn(linear_self_out_dim,
-                                                        linear_self_in_dim) * (linear_self_in_dim ** -0.5))
-
-            # num_codebooks == 3 and hidden_dim == 2 and codebook_size == 2,
-            # the expression below has the value:
-            #tensor([[ True,  True, False, False],
-            #        [ True,  True, False, False],
-            #        [ True,  True,  True,  True],
-            #        [ True,  True,  True,  True]])
-            self.register_buffer('linear_self_mask',
-                                 ((torch.arange(linear_self_out_dim) // hidden_dim).unsqueeze(1) >=
-                                  (torch.arange(linear_self_in_dim) // codebook_size).unsqueeze(0)))
-        else:
-            self.register_parameter('linear_self', None)
-            self.register_buffer('linear_self_mask', None)
-
-
-        self.norm = nn.BatchNorm1d(num_codebooks * hidden_dim)
-        self.linear2 = nn.Parameter(torch.randn(num_codebooks, codebook_size, hidden_dim) * (hidden_dim ** -0.5))
+        self.linear2 = nn.Parameter(torch.randn(num_codebooks, codebook_size,
+                                                hidden_channels) * (hidden_channels ** -0.5))
         self.bias2 = nn.Parameter(torch.zeros(num_codebooks, codebook_size))
 
+        self.cross_entropy_loss = torch.nn.CrossEntropyLoss(ignore_index=ignore_index,
+                                                            reduction=reduction)
 
     def forward(self,
                 predictor: Tensor,
@@ -81,7 +78,7 @@ class JointCodebookPredictor(nn.Module):
         Forward function.
 
         Args:
-          predictor: a Tensor of some real type, with shape (*, predictor_dim).
+          predictor: a Tensor of some real type, with shape (*, predictor_channels).
           codebook_indexes:  a Tensor of integers, of shape (*, num_codebooks),
              where the '*' should be the same as for `predictor`.  It will be
              converted to type torch.int64.  Should contain indexes of codebook
@@ -91,58 +88,47 @@ class JointCodebookPredictor(nn.Module):
              all-negative or all-nonnegative indexes, meaning that (codebook_indexes >= 0)
              should not vary as you change the last index into it.
 
-        Returns: total_logprob, total_count, where:
-           total_logprob: a scalar Tensor, containing the total log-probability of all
-                  the nonnegative codebook indexes,
-           total_count: a scalar Tensor containing the total count of nonzero frames,
-                  satisfying total_count <= codebook_indexes.numel() / num_groups
+        Returns:
+           cross_entropy_loss, will be a total negated log-probability, assuming
+           reduction == 'sum'.
         """
         codebook_indexes = codebook_indexes.to(torch.int64)
-        assert list(predictor.shape[:-1]) == list(codebook_indexes.shape[:-1])
+
         assert codebook_indexes.shape[-1] == self.num_codebooks
+        assert list(predictor.shape[:-1]) == list(codebook_indexes.shape[:-1])
+        predictor = predictor.reshape(-1, predictor.shape[-1])  # (N, predictor_channels)
+        codebook_indexes = codebook_indexes.reshape(-1, codebook_indexes.shape[-1])
 
-        tot_codebook_dim = self.num_codebooks * self.codebook_size
+        hidden_predictor = self.linear1(predictor)
 
-        common_shape = list(predictor.shape[:-1])
-        codebook_one_hot = torch.zeros(*common_shape, self.num_codebooks,
-                                       self.codebook_size,
-                                       device=predictor.device)
+        first_indexes = codebook_indexes[:,:-1] # all but last codebook indexes; (N, num_codebooks-1)
+        num_codebooks = self.num_codebooks
+        codebook_size = self.codebook_size
+        # now first_indexes can be used as indexes into self.codebook_embedding.
+        # do clamp(min=0) to avoid errors on padding (-100).. these frames will
+        # later be ignored in the loss, so the value can be treated as a don't-care.
+        first_indexes = first_indexes.clamp(min=0) + torch.arange(0, (num_codebooks - 1) * codebook_size,
+                                                                  step=codebook_size,
+                                                                  device=first_indexes.device)  # (N, num_codebooks-1)
 
-        codebook_mask = (codebook_indexes >= 0).unsqueeze(-1) # (*, num_codebooks, 1)
-        codebook_indexes_floor = torch.clamp(codebook_indexes, min=0).unsqueeze(-1) # (*, num_codebooks, 1)
-        codebook_one_hot.scatter_(dim=-1, index=codebook_indexes_floor,
-                                  src=codebook_mask.to(torch.float32))
-        codebook_one_hot = codebook_one_hot.reshape(*common_shape,
-                                                    tot_codebook_dim) # (*, tot_codebook_dim)
 
-        hidden = self.linear1(predictor)
-        if self.linear_self is not None:
-            codebook_one_hot_part = torch.narrow(codebook_one_hot, -1, 0,
-                                                 tot_codebook_dim - self.codebook_size)
-            self_predictor = torch.matmul(codebook_one_hot_part,
-                                          (self.linear_self * self.linear_self_mask).transpose(0, 1))
+        first_embeddings = self.codebook_embedding(first_indexes) * (self.hidden_channels ** 0.5) # (N, num_codebooks-1, hidden_channels)
+        all_embeddings = torch.cat((hidden_predictor.unsqueeze(1),
+                                    first_embeddings),
+                                   dim=1) # (N, num_codebooks, hidden_channels)
 
-            # add the 'self_predictor' term to all but the 1st
-            # block of "hidden".
-            hidden_part = torch.narrow(hidden, -1, self.hidden_dim,
-                                       self.hidden_dim * (self.num_codebooks - 1))
+        # after cumsum, all positions will contain a contribution from 'hidden_predictor'; and
+        # will also contain contributions from all *previous* codebooks.  Here, "position" means
+        # a position in {0..num_codebooks-1}
+        all_embeddings = torch.cumsum(all_embeddings, dim=1) # (N, num_codebooks, hidden_channels)
 
-            hidden_part += self_predictor
+        all_embeddings = self.nonlin(all_embeddings)
 
-        hidden = nn.functional.relu(hidden)
-        hidden = hidden.reshape(-1, self.hidden_dim * self.num_codebooks)
-        hidden = self.norm(hidden)
-        hidden = hidden.reshape(*common_shape, self.num_codebooks, self.hidden_dim)  # (*, num_codebooks, hidden_dim)
+        logprobs = torch.matmul(all_embeddings.transpose(0, 1), # (num_codebooks, N, hidden_channels)
+                                self.linear2.transpose(1, 2)   #  (num_codebooks, hidden_channels, codebook_size)
+                                ).transpose(0, 1)  # (N, num_codebooks, codebook_size)
+        logprobs += self.bias2
+        logprobs = logprobs.log_softmax(dim=2)  # (N, num_codebooks, codebook_size)
 
-        logprobs = torch.matmul(hidden.unsqueeze(-2), self.linear2.transpose(1, 2)).squeeze(-2) + self.bias2
-
-        # logprobs: (*, num_codebooks, codebook_size)
-        logprobs = logprobs.log_softmax(dim=-1)
-        logprobs = logprobs.reshape(*common_shape, self.num_codebooks * self.codebook_size)
-
-        tot_logprob = torch.dot(logprobs.reshape(-1), codebook_one_hot.reshape(-1))
-        # the select() part is to select only the mask for one of the codebooks (they should
-        # all be the same), as we want the total number of frames.
-        tot_count = codebook_mask.select(dim=-2, index=0).sum()
-
-        return (tot_logprob, tot_count)
+        return self.cross_entropy_loss(logprobs.reshape(-1, codebook_size),
+                                       codebook_indexes.reshape(-1))

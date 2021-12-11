@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from torch import Tensor
 from quantization import read_hdf5_data, Quantizer, QuantizerTrainer
-from prediction import JointCodebookPredictor
+from prediction import JointCodebookLoss
 
 def _test_train_from_file():
     train, valid = read_hdf5_data('training_data.hdf5')
@@ -102,12 +102,11 @@ def _test_joint_predictor():
             cur_offset += B
             yield data[start:end,:].to(device).to(dtype=torch.float)
 
-    predictor = JointCodebookPredictor(predictor_dim=dim,
-                                       num_codebooks=bytes_per_frame,
-                                       self_prediction=True).to(device)
+    predictor = JointCodebookLoss(predictor_channels=dim,
+                                  num_codebooks=bytes_per_frame).to(device)
 
     optim = torch.optim.Adam(
-        predictor.parameters(), lr=0.0001, betas=(0.9, 0.98), eps=1e-9, weight_decay=1.0e-06
+        predictor.parameters(), lr=0.001, betas=(0.9, 0.98), eps=1e-9, weight_decay=1.0e-06
     )
     scheduler = torch.optim.lr_scheduler.StepLR(optim,
                                                 step_size=2000,
@@ -119,9 +118,11 @@ def _test_joint_predictor():
     for x in minibatch_generator(train, repeat=True):
         x = x.to(device)
         encoding = quantizer.encode(x + x_noise_level * torch.randn_like(x))
-        tot_logprob, tot_count = predictor(x, encoding) # should be easy to predict encoding from x.
+        tot_loss = predictor(x, encoding) # should be easy to predict encoding from x.
 
-        loss = -(tot_logprob / tot_count)
+        tot_count = x.shape[0]
+
+        loss = tot_loss / tot_count
         if count % 200 == 0:
             logging.info(f"Iter={count}, loss = {loss.item():.3f}")
         loss.backward()
@@ -135,5 +136,5 @@ def _test_joint_predictor():
 
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
-    _test_train_from_file()
+    #_test_train_from_file()
     _test_joint_predictor()
