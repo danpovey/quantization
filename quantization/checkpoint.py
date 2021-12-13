@@ -52,7 +52,7 @@ def _test1():
     ans = checkpoint(l, x, y, None)
     #ans = l(x, y, None)
     print("ans = ", ans)
-    ans.sum().backward()
+    (-ans).sum().backward()
     print("y grad = ", y.grad)
 
 
@@ -65,7 +65,7 @@ def _test2():
     ans = checkpoint(torch.sum, ans)
     #ans = l(x, y, None)
     print("ans = ", ans)
-    ans.backward()
+    (-ans).backward()
     print("x grad = ", x.grad)
 
 if __name__ == '__main__':
