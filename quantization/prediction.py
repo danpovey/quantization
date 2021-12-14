@@ -12,6 +12,7 @@ def joint_codebook_loss(predictor: Tensor,
                         linear1_bias: Optional[Tensor],
                         codebook_embedding_weight: Tensor,
                         linear2_weight: Tensor,
+                        linear2b_weight: Tensor,
                         linear2_bias: Tensor,
                         ignore_index: int,
                         reduction: str) -> Tensor:
@@ -25,6 +26,8 @@ def joint_codebook_loss(predictor: Tensor,
                                                    hidden_channels)
        linear2_weight: weight of shape (num_codebooks, codebook_size,
                                                 hidden_channels)
+       linear2b_weight: weight of shape (num_codebooks, codebook_size,
+                                                predictor_dim)
        linear2_bias: bias of shape (num_codebooks, codebook_size)
        ignore_index: index to ignore in cross entropy loss, e.g. -100
        reduction: reduction in cross entropy loss, e.g. 'sum'
@@ -46,8 +49,9 @@ def joint_codebook_loss(predictor: Tensor,
                                                               step=codebook_size,
                                                               device=first_indexes.device)  # (N, num_codebooks-1)
 
+    first_embeddings_scale = 0.5 * ((hidden_channels / num_codebooks) ** 0.5)
     first_embeddings = torch.nn.functional.embedding(first_indexes,
-                                                     codebook_embedding_weight) * (hidden_channels ** 0.5) # (N, num_codebooks-1, hidden_channels)
+                                                     codebook_embedding_weight) * first_embeddings_scale # (N, num_codebooks-1, hidden_channels)
 
 
     hidden_predictor = torch.nn.functional.linear(predictor, linear1_weight, linear1_bias)
@@ -65,6 +69,11 @@ def joint_codebook_loss(predictor: Tensor,
     logprobs = torch.matmul(all_embeddings.transpose(0, 1), # (num_codebooks, N, hidden_channels)
                             linear2_weight.transpose(1, 2)   #  (num_codebooks, hidden_channels, codebook_size)
                             ).transpose(0, 1)  # (N, num_codebooks, codebook_size)
+
+    logprobs += torch.matmul(predictor, # (N, predictor_channels)
+                             linear2b_weight.transpose(1, 2) # (num_codebooks, predictor_channels, codebook_size)
+                             ).transpose(0, 1) # (N, num_codebooks, codebook_size)
+
     logprobs += linear2_bias
     logprobs = logprobs.log_softmax(dim=2)  # (N, num_codebooks, codebook_size)
 
@@ -137,10 +146,11 @@ class JointCodebookLoss(nn.Module):
                                                hidden_channels,
                                                _weight=torch.randn((num_codebooks - 1) * codebook_size,
                                                                    hidden_channels) * (hidden_channels ** -0.5))
-        self.nonlin = nn.ReLU(inplace=True)
 
         self.linear2_weight = nn.Parameter(torch.randn(num_codebooks, codebook_size,
                                                 hidden_channels) * (hidden_channels ** -0.5))
+        self.linear2b_weight = nn.Parameter(torch.randn(num_codebooks, codebook_size,
+                                                predictor_channels) * (predictor_channels ** -0.5))
         self.linear2_bias = nn.Parameter(torch.zeros(num_codebooks, codebook_size))
 
 
@@ -170,6 +180,7 @@ class JointCodebookLoss(nn.Module):
                 self.linear1.weight, self.linear1.bias,
                 self.codebook_embedding.weight,
                 self.linear2_weight,
+                self.linear2b_weight,
                 self.linear2_bias,
                 self.ignore_index,
                 self.reduction)
