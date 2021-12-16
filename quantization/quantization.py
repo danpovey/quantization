@@ -336,6 +336,35 @@ class Quantizer(nn.Module):
         #     and doubles every 2 iterations to keep the work per iteration
         #     fairly constant.
 
+        # At all points in the algorithm we maintain cur_sumsq and (conceptually)
+        # cur_deltas (however in some parts cur_deltas is not instantiated, see
+        # gather_deltas).
+        #
+        # cur_indexes: (B, N, K, L), initially (B, num_codebooks, codebook_size, 1),
+        #   gives the codebook indexes corresponding to the k'th value of the n'th
+        #   choice.  Initially this is just an arange expression but from the 1st
+        #   iter of the algorithm it changes to something nontrivial.
+        #
+        # cur_sumsq: (B, N, K), is the sum-squared error of x versus its predicted value
+        # from the codebooks, if we were to
+        # make the n'th choice with value k without making any of the other N-1 choices, i.e.
+        # if we were to leave the other choices at the value we had at input.
+        # Specifically, it is always supposed to equal the value of
+        #  ((x_err + cur_deltas)**2).sum(dim=-1)
+        # .. but we keep it around separately because it enables an optimization.
+        #
+        # cur_deltas: (B, N, K, dim), is the change in x_err (with x_err =
+        # x_approx - x and x_approx being a sum of codebook indexes) if we were
+        # to make the n'th choice with value k without making any of the other
+        # N-1 choices.
+        # At the current point, i.e. at the start of the algorithm,
+        # cur_deltas[b][n][k] says "what would be the change in x_err if we
+        # were to replace the current choice of the n'th codebook entry-- i.e.
+        # the choice reflected in `indexes`-- with value k?  [In general,
+        # cur_deltas[b][n][k] refers not directly to a codebook indexes, but
+        # to an indexes into `cur_indexes` which corresponds to the sequence/combination
+        # of codebook indexes that are stored in cur_indexes[b][n][k].
+
 
         # cur_deltas represents the change in x_err from making each choice (while
         # leaving all the other choices un-made by just keeping the passed-in/old
@@ -344,30 +373,68 @@ class Quantizer(nn.Module):
         N = self.num_codebooks
         K = self.codebook_size
         L = 1  # L is the number of codebooks covered by each choice.
-        cur_deltas = all_centers - old_centers  # (B, N, K, dim)
+        # Conceptually we could do:
+        # cur_deltas = all_centers - old_centers  # (B, N, K, dim)
+        # ... however actually we won't be instantiating cur_deltas at this stage of the
+        # algorithm.
         dim = self.dim
-        assert cur_deltas.shape == (B, N, K, dim)
+
         # cur_indexes is the codebook indexes corresponding to 'cur_deltas'.
         cur_indexes = torch.arange(K, device=x.device).reshape(1, 1, K, 1).expand(B, N, K, L)
 
-        # cur_sumsq: (B, N, K), is the sum-squared error if we were to
-        # make the n'th choice without making any of the other N-1 choices, i.e.
-        # if we were to leave the other choices at the value we had at input.
-        # Specifically, it is always supposed to equal the value of
-        #  ((x_err + cur_deltas)**2).sum(dim=-1)
-        # .. but we keep it around separately because it enables an optimization.
-        modified_err = x_err + cur_deltas # (B, N, K, dim)
+        if True:
+            # compute cur_sumsq using an efficient approach
+            x_err_sumsq = (x_err ** 2).sum(dim=-1) # (B, 1, 1)
 
-        # cur_sumsq: (B, N, K), equivalent to: ((x_err + cur_deltas)**2).sum(dim=-1)
-        # We really want batched vector-vector product her, which torch does not
-        # explicitly support, so we use a matrix multiplication with 1x1 output.
-        cur_sumsq = torch.matmul(modified_err.unsqueeze(-2),
-                                 modified_err.unsqueeze(-1)).squeeze(-1).squeeze(-1)
+            x_remaining = x_err - old_centers  # (B, num_codebooks, 1, dim): the x_err after subtracting
+            # each of the codebooks; if we add back to this any given
+            # codebook vector (from all_centers), we'll get the error
+            # if we were to
+            # choose that codebook entry instead of the one actually chosen.
 
-        assert cur_sumsq.shape == (B, N, K)
-        # x_err_sumsq: (B, 1, 1), is the sum-squared of x_err; we'll need it in the loop.
+            x_remaining_sumsq = (x_remaining ** 2).sum(dim=-1) # (B, num_codebooks, 1)
+            # all_centers_sumsq is the sumsq of all the centers..
+            all_centers_sumsq = (all_centers ** 2).sum(dim=-1) # (1, num_codebooks, codebook_size)
+
+            cross_sum = torch.matmul(all_centers, # (1, num_codebooks, codebook_size, dim)
+                                     x_remaining.permute(2, 1, 3, 0)  # (1, num_codebooks, dim, B)
+            ) # (1, num_codebooks, codebook_size, B)
+            cross_sum = cross_sum.squeeze(0).permute(2, 0, 1) # (B, num_codebooks, codebook_size)
+            # (B, num_codebooks, codebook_size); interpret as (B, N, K)
+            cur_sumsq = x_remaining_sumsq + all_centers_sumsq + 2 * cross_sum
+            assert cur_sumsq.shape == (B, N, K)
+
+            # gather_deltas (which will be re-defined below) is a lambda from
+            # `this_indexes`, a LongTensor of shape (B, N, new_K, 1) [which
+            # at the current iteration would equal (B, num_codebooks, new_K, 1)]
+            # with elements in
+            # {0..K-1} [i.e. 0..codebook_size-1], to the new "cur_deltas".
+            # It is provided as a workaround in
+            # case we did not physically instantiate cur_deltas on this iteration.
+            # In general cur_deltas is supposed to represent "change in encoded
+            # value" if we were to make a particular modified index choice, leaving
+            # all other choices as they were on entry.
+            # gather_deltas is supposed to be a lambda from this_indexes to the
+            # something equivalent to following expression (if cur_deltas had actually
+            # existed):
+            #   torch.gather(input=cur_deltas, dim=2, index=this_indexes.expand(B, N, new_K, dim))
+
+            gather_deltas = lambda this_indexes: (
+                torch.gather(input=all_centers.expand(B, N, K, dim), dim=2,
+                             index=this_indexes.expand(B, N, -1, dim)) - old_centers
+            )
+        else:
+            cur_deltas = all_centers - old_centers  # (B, N, K, dim)
+            ## cur_sumsq: (B, N, K), equivalent to: ((x_err + cur_deltas)**2).sum(dim=-1)
+            ## We really want batched vector-vector product her, which torch does not
+            ## explicitly support, so we use a matrix multiplication with 1x1 output.
+            modified_err = x_err + cur_deltas # (B, N, K, dim)
+            cur_sumsq = torch.matmul(modified_err.unsqueeze(-2),
+                                     modified_err.unsqueeze(-1)).squeeze(-1).squeeze(-1)
+            gather_deltas = None
+
+            # x_err_sumsq: (B, 1, 1), is the sum-squared of x_err; we'll need it in the loop.
         x_err_sumsq = (x_err**2).sum(dim=-1)
-        gather_deltas = None # will be a lambda, see below.
 
         K_cutoff_base = 8 if self.codebook_size <= 16 else 16
 
@@ -400,16 +467,33 @@ class Quantizer(nn.Module):
 
                 this_indexes = this_indexes.unsqueeze(-1)
 
-                # cur_indexes is (B, N, new_K, dim), but sorted from worst to best.
+                # cur_indexes is (B, N, new_K, L), but with only the chosen
+                # indexes kept.
                 cur_indexes = torch.gather(input=cur_indexes, dim=2,
                                            index=this_indexes.expand(B, N, new_K, L))
 
-                if cur_deltas is not None:
+                if gather_deltas is None:
                     # also sort cur_deltas in the same way
                     cur_deltas = torch.gather(input=cur_deltas, dim=2,
                                               index=this_indexes.expand(B, N, new_K, dim))
                 else:
+                    # gather_deltas should be a lambda from:
+                    # this_indexes: a LongTensor of shape (B, N, new_K, 1) containing elements in {0..K-1}
+                    # to the new "deltas" which should be of shape
+                    # (B, N, new_K, dim)
+                    # representing the difference from the baseline "x_offset" if we choose this
+                    # index for this codebook or range of codebooks, leaving other choices
+                    # as they were at entry to this function.
+
+                    #if cur_deltas is not None:
+                    #    cur_deltas_alt = torch.gather(input=cur_deltas, dim=2,
+                    #                                  index=this_indexes.expand(B, N, new_K, dim))
                     cur_deltas = gather_deltas(this_indexes)
+                    #if cur_deltas is not None and cur_deltas.shape == cur_deltas_alt.shape:
+                    #    print("cur_deltas: ", cur_deltas[:3,:3,:3,:3])
+                    #    print("cur_deltas_alt: ", cur_deltas_alt[:3,:3,:3,:3])
+                    #    assert torch.allclose(cur_deltas, cur_deltas_alt)
+                    gather_deltas = None
                 K = new_K
             else:
                 # Combine pairs of choices.  We know that N > 1.

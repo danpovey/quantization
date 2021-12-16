@@ -136,5 +136,5 @@ def _test_joint_predictor():
 
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
-    #_test_train_from_file()
+    _test_train_from_file()
     _test_joint_predictor()
