@@ -484,15 +484,7 @@ class Quantizer(nn.Module):
                     # representing the difference from the baseline "x_offset" if we choose this
                     # index for this codebook or range of codebooks, leaving other choices
                     # as they were at entry to this function.
-
-                    #if cur_deltas is not None:
-                    #    cur_deltas_alt = torch.gather(input=cur_deltas, dim=2,
-                    #                                  index=this_indexes.expand(B, N, new_K, dim))
                     cur_deltas = gather_deltas(this_indexes)
-                    #if cur_deltas is not None and cur_deltas.shape == cur_deltas_alt.shape:
-                    #    print("cur_deltas: ", cur_deltas[:3,:3,:3,:3])
-                    #    print("cur_deltas_alt: ", cur_deltas_alt[:3,:3,:3,:3])
-                    #    assert torch.allclose(cur_deltas, cur_deltas_alt)
                     gather_deltas = None
                 K = new_K
             else:
