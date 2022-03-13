@@ -75,7 +75,6 @@ def joint_codebook_loss(predictor: Tensor,
                              ).transpose(0, 1) # (N, num_codebooks, codebook_size)
 
     logprobs += linear2_bias
-    logprobs = logprobs.log_softmax(dim=2)  # (N, num_codebooks, codebook_size)
 
     return torch.nn.functional.cross_entropy(logprobs.reshape(-1, codebook_size),
                                              codebook_indexes.reshape(-1),
