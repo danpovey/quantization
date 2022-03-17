@@ -36,11 +36,15 @@ class Quantizer(nn.Module):
         assert is_power_of_two(num_codebooks)
 
         self.to_logits = nn.Linear(dim, codebook_size * num_codebooks)
-        self.logits_scale = 4
 
         # self.centers: (num_codebooks, codebook_size, dim)
         self.centers = nn.Parameter(self.to_logits.weight.detach().clone().reshape(
             num_codebooks, codebook_size, dim))
+
+        self.logits_scale = nn.Parameter(torch.zeros(()))
+        self.centers_scale = nn.Parameter(torch.zeros(()))
+        self.scale_speed = 10.0 # affects learning rate of scales
+
 
         # We give each Quantizer a unique 8-digit hex identifier, which we'll use to reduce the
         # probability of mixing up the outputs of different Quantizers.
@@ -68,8 +72,11 @@ class Quantizer(nn.Module):
         The expression we use assumes balanced codebook probabilities, which is true
         in practice (as long as index_entropy_loss in training is fairly small).
         """
-        return self.centers.mean(dim=1).sum(dim=0).detach()
+        return self.get_centers().mean(dim=1).sum(dim=0).detach()
 
+    def get_centers(self):
+        scale = (self.centers_scale * self.scale_speed).exp()
+        return scale * self.centers
 
     def get_product_quantizer(self) -> 'Quantizer':
         """
@@ -87,6 +94,9 @@ class Quantizer(nn.Module):
         ans.apply_mask = False
 
         with torch.no_grad():
+            ans.logits_scale[:] = self.logits_scale
+            ans.centers_scale[:] = self.centers_scale
+            ans.scale_speed = self.scale_speed
             for c_out in range(new_num_codebooks):
                 c_in1 = 2 * c_out
                 c_in2 = 2 * c_out + 1
@@ -128,7 +138,8 @@ class Quantizer(nn.Module):
         indexes_expanded = indexes.transpose(0, 1).contiguous().unsqueeze(-1).expand(self.num_codebooks, B, self.dim)
         # self.centers: (num_codebooks, codebook_size, dim)
         # chosen_codebooks: (num_codebooks, B, dim).
-        chosen_codebooks = torch.gather(self.centers, dim=1, index=indexes_expanded)
+        centers = self.get_centers()
+        chosen_codebooks = torch.gather(centers, dim=1, index=indexes_expanded)
 
         # x_approx: (B, dim), this is the sum of the chosen rows of `to_output`
         # corresponding to the chosen codebook entries, this would correspond to
@@ -148,7 +159,7 @@ class Quantizer(nn.Module):
           - returning c_{ij} / sqrt(c_{ii} c_{ij}), which is a symmetric
             matrix with values in [0,1]
         """
-        centers = self.centers.detach()
+        centers = self.get_centers().detach()
         codebook_means = centers.mean(dim=1, keepdim=True) # (num_codebooks, 1, dim)
         centers = centers - codebook_means # make each codebook zero-mean.
 
@@ -262,7 +273,8 @@ class Quantizer(nn.Module):
         return indexes.reshape(*x.shape[:-1], -1)
 
     def _logits(self, x: Tensor) -> Tensor:
-        return self.to_logits(x) * self.logits_scale
+        x = (self.logits_scale * self.scale_speed).exp() * x
+        return self.to_logits(x)
 
     def _compute_indexes(self, x: Tensor, refine_indexes_iters: int = 3) -> Tensor:
         """
@@ -315,7 +327,7 @@ class Quantizer(nn.Module):
         # indexes_expanded has shape (B, self.num_codebooks, 1, self.dim)
         indexes_expanded = indexes.unsqueeze(-1).unsqueeze(-1).expand(B, self.num_codebooks, 1, self.dim)
         # all_centers: (1, num_codebooks, codebook_size, dim)
-        all_centers = self.centers.unsqueeze(0)
+        all_centers = self.get_centers().unsqueeze(0)
         # centers_expanded has shape (B, self.num_codebooks, self.codebook_size, self.dim)
         centers_expanded = all_centers.expand(B, self.num_codebooks, self.codebook_size, self.dim)
 
