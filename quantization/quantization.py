@@ -94,8 +94,8 @@ class Quantizer(nn.Module):
         ans.apply_mask = False
 
         with torch.no_grad():
-            ans.logits_scale[:] = self.logits_scale
-            ans.centers_scale[:] = self.centers_scale
+            torch.nn.init.constant_(ans.logits_scale, self.logits_scale.item())
+            torch.nn.init.constant_(ans.centers_scale, self.centers_scale.item())
             ans.scale_speed = self.scale_speed
             for c_out in range(new_num_codebooks):
                 c_in1 = 2 * c_out
