@@ -22,6 +22,8 @@ def _test_quantizer_trainer():
         nn.Linear(dim, dim),
     ).to(device)
     trainer = QuantizerTrainer(dim=dim, bytes_per_frame=4,
+                               phase_one_iters=500,
+                               phase_two_iters=500,
                                device=torch.device('cuda'))
 
     B = 600
