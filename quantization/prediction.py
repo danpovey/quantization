@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch import Tensor
 from typing import Tuple, Optional
-from checkpoint import checkpoint # from current directory.. could not get relative import to work..
+from .checkpoint import checkpoint # from current directory.. could not get relative import to work..
 
 # functional version of joint codebook loss, added so that we can more easily implement
 # checkpointing to save memory.
