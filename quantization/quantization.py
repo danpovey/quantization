@@ -202,6 +202,8 @@ class Quantizer(nn.Module):
                    loss function, so we can select reasonable classes before refining the indexes.
              logits_entropy_loss: the class entropy loss, from the logits, which approaches
                    zero when all classes of all codebooks are equi-probable (in the logits output).
+                   We did not find it necessary to use entropy_scale.
+                   See detail introduction of entropy_scale in fuction "trainer.step".
              index_entropy_loss: the class entropy loss, from the computed indexes,  which approaches
                   zero when all classes of all codebooks are equi-probable (in the indexes output).
                   Not differentiable but useful for diagnostics.
@@ -518,7 +520,6 @@ class Quantizer(nn.Module):
 
                 even_sumsq = even_sumsq.unsqueeze(3) # (B, new_N, K, 1)
                 odd_sumsq = odd_sumsq.unsqueeze(2) # (B, new_N, 1, K)
-                # cur_sumsq below is a partial version, we have to add another term.
                 # The new version of cur_sumsq that we want can be expressed as:
                 #   ((a + b + c)**2).sum(dim=-1),
                 # where a = x_err, b == even_deltas, c == odd_deltas.  Ignoring the summation, we
@@ -707,9 +708,6 @@ class QuantizerTrainer(object):
         tot_loss = (reconstruction_loss +
                     logprob_loss +
                     logits_entropy_loss * entropy_scale)
-        # We want to maximize frame_entropy if it is less than frame_entropy_cutoff.
-        #tot_loss -= torch.minimum(self.frame_entropy_cutoff,
-        #                          frame_entropy)
 
         tot_loss.backward()
         self.optim.step()
